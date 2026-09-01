@@ -137,6 +137,22 @@ def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+async def _deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """How an owner-only command answers everybody else: exactly the way a
+    misspelling does.
+
+    The intent was always to avoid confirming the command exists, and a bare
+    `return` looked like the way to do that. It is not: a bot that answers
+    every command it has and ignores precisely one has just pointed at the
+    interesting one, and to the person who typed it the bot simply looks
+    broken. Giving back the same sentence a typo gets makes the owner-only
+    commands indistinguishable from commands that were never there.
+    """
+    await unknown_command(update, context)
+
+
+
+
 # Telegram's long-poll window -- see the note in main().
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
 
@@ -442,7 +458,7 @@ async def dbdump_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/dbdump -- exports every table in this bot's own database as one
     zip of CSVs. Owner-only."""
     if not _is_admin(update.effective_user.id):
-        return
+        return await _deny(update, context)
     status = await LiveMessage.reply_to(update.message, "Exporting the database...")
     try:
         data = await asyncio.to_thread(dump_database_csv_zip)
@@ -459,7 +475,7 @@ async def messageas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot. Only works if the user has messaged the bot before (Telegram
     doesn't let bots cold-message anyone). Owner-only for obvious reasons."""
     if not _is_admin(update.effective_user.id):
-        return
+        return await _deny(update, context)
 
     if len(context.args) < 2 or not context.args[0].lstrip("-").isdigit():
         await update.message.reply_text("Usage: /messageas <user_id> <message text>")
@@ -479,7 +495,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     process started, and active-user counts. Owner-only, same reasoning as
     /dbdump: this is operational info, not something every user should see."""
     if not _is_admin(update.effective_user.id):
-        return
+        return await _deny(update, context)
     now = datetime.now(timezone.utc)
     users_hour = await asyncio.to_thread(count_active_users_since, now - timedelta(hours=1))
     users_since_start = await asyncio.to_thread(count_active_users_since, START_TIME)
@@ -528,6 +544,7 @@ async def _reply_image(update: Update, data: bytes, stem: str, reply_markup=None
             document=BytesIO(data),
             filename=f"{stem}.{_image_extension(data)}",
             reply_markup=reply_markup,
+            disable_content_type_detection=True,
         )
     return await update.message.reply_photo(BytesIO(data), reply_markup=reply_markup)
 
@@ -580,9 +597,19 @@ async def _download_and_send_video(update: Update, context: ContextTypes.DEFAULT
                     # As a document Telegram passes the file through
                     # untouched -- same container, same bitrate as yt-dlp
                     # produced. As a video it re-encodes for streaming.
+                    #
+                    # disable_content_type_detection is what makes that
+                    # true, and leaving it off is why /lossless looked
+                    # broken for videos while working for images: the Bot
+                    # API sniffs an uploaded document by default, decides
+                    # an .mp4 is really a video, and delivers it as one --
+                    # re-encoded, which is the entire thing this branch
+                    # exists to avoid. It does not do that to a .jpg,
+                    # which is why the image paths were unaffected.
                     await update.message.reply_document(
                         f, filename=os.path.basename(path), caption=caption,
                         reply_markup=_nudge_kb(), read_timeout=120, write_timeout=120,
+                        disable_content_type_detection=True,
                     )
                 else:
                     await update.message.reply_video(
@@ -692,7 +719,8 @@ async def _handle_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
                 await update.message.reply_media_group(
                     [
                         InputMediaDocument(
-                            BytesIO(b), filename=f"twitter_{n}.{_image_extension(b)}"
+                            BytesIO(b), filename=f"twitter_{n}.{_image_extension(b)}",
+                            disable_content_type_detection=True,
                         )
                         for n, b in enumerate(images, start=1)
                     ]

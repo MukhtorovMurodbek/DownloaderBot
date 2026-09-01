@@ -70,7 +70,9 @@ from telegram.ext import (
 import cards
 import family_link
 import i18n
+import lifecycle
 import platforms
+from live_message import LiveMessage, edit_in_place
 from db import (
     init_db,
     get_caption_enabled,
@@ -84,6 +86,7 @@ from db import (
 )
 from video import download_video, TooLarge
 from shared_features import (
+    refuse_new_work,
     attach_maintenance,
     CANCEL_PICK_ALL,
     CANCEL_PICK_NONE,
@@ -172,6 +175,7 @@ def build_help_text(lang: str) -> str:
 # commands are described in the language they switch to (self-explanatory
 # by script/language, since Telegram's command menu itself isn't per-user).
 BOT_COMMANDS = [
+    BotCommand("start", "Start here / see the instructions"),
     BotCommand("help", "How this bot works"),
     BotCommand("caption", "Toggle the credit caption on downloads"),
     BotCommand("lossless", "Send downloads as uncompressed files"),
@@ -186,13 +190,18 @@ BOT_COMMANDS = [
 
 async def _reply(update: Update, text: str, **kwargs):
     """Works whether the update came from a command or a button tap. A tap
-    edits the tapped message in place -- so choosing a language turns the
+    evolves the tapped message in place -- so choosing a language turns the
     picker itself into the instructions rather than leaving a stale picker
-    sitting above them -- while a command has no earlier bot message to edit
-    and so always sends fresh."""
+    sitting above them -- while a command has no earlier bot message to reuse
+    and so always sends fresh.
+
+    "In place" only holds while that message is still the last thing in the
+    chat; once the user has said anything since, the answer is sent fresh
+    instead of being written somewhere they have scrolled past. See
+    live_message.py."""
     if update.message:
-        return await update.message.reply_text(text, **kwargs)
-    return await update.callback_query.message.edit_text(text, **kwargs)
+        return await LiveMessage.reply_to(update.message, text, **kwargs)
+    return await edit_in_place(update.callback_query.message, update.get_bot(), text, **kwargs)
 
 
 async def _continue_start(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
@@ -368,7 +377,7 @@ async def caption_toggle_callback(update: Update, context: ContextTypes.DEFAULT_
     await asyncio.to_thread(set_caption_enabled, update.effective_user.id, enabled)
     state = i18n.t(lang, "caption_state_on" if enabled else "caption_state_off")
     await query.answer(i18n.t(lang, "caption_toggle_answer", state=state))
-    await query.message.edit_text(
+    await edit_in_place(query.message, context.bot, 
         i18n.t(lang, "caption_status", state=state),
         reply_markup=_caption_keyboard(lang, enabled),
     )
@@ -423,7 +432,7 @@ async def lossless_toggle_callback(update: Update, context: ContextTypes.DEFAULT
     await asyncio.to_thread(set_lossless_enabled, update.effective_user.id, enabled)
     state = i18n.t(lang, "lossless_state_on" if enabled else "lossless_state_off")
     await query.answer(i18n.t(lang, "lossless_toggle_answer", state=state))
-    await query.message.edit_text(
+    await edit_in_place(query.message, context.bot, 
         i18n.t(lang, "lossless_status", state=state),
         reply_markup=_lossless_keyboard(lang, enabled),
     )
@@ -434,15 +443,15 @@ async def dbdump_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     zip of CSVs. Owner-only."""
     if not _is_admin(update.effective_user.id):
         return
-    status = await update.message.reply_text("Exporting the database...")
+    status = await LiveMessage.reply_to(update.message, "Exporting the database...")
     try:
         data = await asyncio.to_thread(dump_database_csv_zip)
     except Exception as exc:
-        await status.edit_text(f"⚠️ Export failed: {exc}")
+        await status.set(context.bot, f"⚠️ Export failed: {exc}")
         return
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
     await update.message.reply_document(document=BytesIO(data), filename=f"downloaderbot_db_{stamp}.zip")
-    await status.delete()
+    await status.delete(context.bot)
 
 
 async def messageas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -530,23 +539,34 @@ async def _download_and_send_video(update: Update, context: ContextTypes.DEFAULT
     instead of adding a second "Downloading..." on top of whatever the
     caller already showed."""
     lang = await i18n.get_lang(update.effective_user.id, context)
+    # A download outlasts the shutdown grace period, so starting one now would
+    # end in silence. A few seconds' wait beats a lost file.
+    refusal = await refuse_new_work(
+        lang, update.effective_user.id, update.effective_chat.id
+    )
+    if refusal:
+        if status is None:
+            await update.message.reply_text(refusal)
+        else:
+            await status.set(context.bot, refusal)
+        return
     if status is None:
-        status = await update.message.reply_text(i18n.t(lang, "downloading"))
+        status = await LiveMessage.reply_to(update.message, i18n.t(lang, "downloading"))
     else:
-        await status.edit_text(i18n.t(lang, "downloading"))
+        await status.set(context.bot, i18n.t(lang, "downloading"))
 
     # Say so rather than leaving them watching a "Downloading..." that has not
     # actually started yet. Only edited back afterwards if it was shown --
     # editing a message to the text it already has is a Telegram error.
     queued = _slots().locked()
     if queued:
-        await status.edit_text(i18n.t(lang, "queued"))
+        await status.set(context.bot, i18n.t(lang, "queued"))
 
     path = None
-    async with _slots():
+    async with _slots(), lifecycle.busy(update.effective_chat.id, i18n.t(lang, "restarting_send_again")):
         try:
             if queued:
-                await status.edit_text(i18n.t(lang, "downloading"))
+                await status.set(context.bot, i18n.t(lang, "downloading"))
             path = await asyncio.to_thread(download_video, url, tempfile.gettempdir())
             caption = None
             if await asyncio.to_thread(get_caption_enabled, update.effective_user.id):
@@ -569,13 +589,13 @@ async def _download_and_send_video(update: Update, context: ContextTypes.DEFAULT
                         f, caption=caption, reply_markup=_nudge_kb(),
                         read_timeout=120, write_timeout=120,
                     )
-            await status.delete()
+            await status.delete(context.bot)
         except TooLarge as exc:
-            await status.edit_text(str(exc))
+            await status.set(context.bot, str(exc))
             return
         except Exception as exc:
             logger.exception("Video download failed")
-            await status.edit_text(i18n.t(lang, "download_failed", error=exc))
+            await status.set(context.bot, i18n.t(lang, "download_failed", error=exc))
             return
         finally:
             if path and os.path.exists(path):
@@ -586,7 +606,7 @@ async def _download_and_send_video(update: Update, context: ContextTypes.DEFAULT
 
 async def _handle_pinterest(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     lang = await i18n.get_lang(update.effective_user.id, context)
-    status = await update.message.reply_text(i18n.t(lang, "fetching"))
+    status = await LiveMessage.reply_to(update.message, i18n.t(lang, "fetching"))
     try:
         image_bytes = await platforms.fetch_pinterest_image(url)
     except Exception:
@@ -595,7 +615,7 @@ async def _handle_pinterest(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     if image_bytes:
         await _reply_image(update, image_bytes, "pinterest", reply_markup=_nudge_kb())
-        await status.delete()
+        await status.delete(context.bot)
         await _after_send(update, context, lang)
         return
 
@@ -605,11 +625,11 @@ async def _handle_pinterest(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 async def _handle_reddit(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     lang = await i18n.get_lang(update.effective_user.id, context)
-    status = await update.message.reply_text(i18n.t(lang, "fetching"))
+    status = await LiveMessage.reply_to(update.message, i18n.t(lang, "fetching"))
     try:
         post = await platforms.fetch_reddit_post(url)
     except Exception as exc:
-        await status.edit_text(i18n.t(lang, "reddit_fetch_failed", error=exc))
+        await status.set(context.bot, i18n.t(lang, "reddit_fetch_failed", error=exc))
         return
 
     if platforms.reddit_is_media(post):
@@ -618,7 +638,7 @@ async def _handle_reddit(update: Update, context: ContextTypes.DEFAULT_TYPE, url
             try:
                 image = await platforms.fetch_bytes(direct_img)
                 await _reply_image(update, image, "reddit", reply_markup=_nudge_kb())
-                await status.delete()
+                await status.delete(context.bot)
                 await _after_send(update, context, lang)
                 return
             except Exception:
@@ -644,13 +664,13 @@ async def _handle_reddit(update: Update, context: ContextTypes.DEFAULT_TYPE, url
     # most visibly, so "lossless" meaning "except the ones with words on"
     # would be the wrong kind of surprising.
     await _reply_image(update, png, "reddit_post", reply_markup=_nudge_kb())
-    await status.delete()
+    await status.delete(context.bot)
     await _after_send(update, context, lang)
 
 
 async def _handle_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     lang = await i18n.get_lang(update.effective_user.id, context)
-    status = await update.message.reply_text(i18n.t(lang, "fetching"))
+    status = await LiveMessage.reply_to(update.message, i18n.t(lang, "fetching"))
     tweet = await platforms.fetch_tweet_syndication(url)
 
     has_video = bool(tweet and tweet.get("video"))
@@ -681,7 +701,7 @@ async def _handle_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
                 await update.message.reply_media_group(
                     [InputMediaPhoto(BytesIO(b)) for b in images]
                 )
-            await status.delete()
+            await status.delete(context.bot)
             await _after_send(update, context, lang)
             return
         except Exception:
@@ -698,13 +718,13 @@ async def _handle_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
         meta = f"{likes:,} likes" if isinstance(likes, int) else ""
         png = await asyncio.to_thread(cards.render_card, "twitter", source, author, tweet.get("text", ""), meta)
         await _reply_image(update, png, "tweet", reply_markup=_nudge_kb())
-        await status.delete()
+        await status.delete(context.bot)
         await _after_send(update, context, lang)
         return
 
     # X blocked/rate-limited the fetch entirely -- don't error, just hand
     # back the link rather than pretend this failed outright.
-    await status.edit_text(i18n.t(lang, "twitter_fetch_failed_link", url=url))
+    await status.set(context.bot, i18n.t(lang, "twitter_fetch_failed_link", url=url))
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -739,11 +759,17 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _post_init(application):
     await tune_runtime(application)
+    # Before the first getUpdates: if the container this one replaces is
+    # still polling, both get 409 Conflict and this bot's updates are split
+    # between them. See lifecycle.py.
+    await lifecycle.on_start(BOT_NAME)
     await application.bot.set_my_commands(BOT_COMMANDS)
 
 
 async def _post_stop(application):
     await platforms.close_client()
+    # Before flush_on_shutdown, which closes the pool lifecycle writes through.
+    await lifecycle.on_stop(application)
     await flush_on_shutdown(application)
 
 
@@ -752,10 +778,17 @@ def main():
         raise SystemExit("Set DBOT_TOKEN and DBOT_USERNAME environment variables first.")
 
     init_db()
-    app = (
+    builder = (
         ApplicationBuilder().token(BOT_TOKEN)
-        .post_init(_post_init).post_stop(_post_stop).build()
+        .post_init(_post_init).post_stop(_post_stop)
     )
+    # Language, toggles and anything half-finished, kept in Postgres so a
+    # redeploy is not visible to whoever was mid-download. See lifecycle.py.
+    state = lifecycle.persistence()
+    if state is not None:
+        builder = builder.persistence(state)
+    app = builder.build()
+    lifecycle.install(app, BOT_NAME)
     app.add_error_handler(error_handler)
     app.add_handler(TypeHandler(Update, track_activity), group=-1)
     # Runs after track_activity but before every other handler -- a no-op
@@ -807,10 +840,10 @@ def main():
     # answers the moment an update exists -- for a third of the HTTP requests.
     # allowed_updates lists every kind this bot has a handler for, so Telegram
     # stops sending the rest rather than this process parsing and dropping it.
-    app.run_polling(
+    app.run_polling(**lifecycle.polling_kwargs(
         timeout=POLL_TIMEOUT,
         allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY, Update.PRE_CHECKOUT_QUERY],
-    )
+    ))
 
 
 if __name__ == "__main__":

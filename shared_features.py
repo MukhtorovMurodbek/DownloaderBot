@@ -21,9 +21,11 @@ family_link.py. Things that live here:
      state of people who stopped using the bot months ago.
 """
 import asyncio
+import gc
 import logging
 import os
 import socket
+import sys
 import time
 import traceback
 import uuid
@@ -41,6 +43,8 @@ from telegram.ext import ApplicationHandlerStop
 
 import db
 import i18n
+import lifecycle
+import live_message
 
 # ---------------------------------------------------------------------------
 # Sibling-bot cross-promotion
@@ -113,19 +117,46 @@ def language_keyboard(current: str | None = None) -> InlineKeyboardMarkup:
 
 WORKER_THREADS = int(os.environ.get("WORKER_THREADS", "4"))
 
+# The garbage collector's generation-0 threshold. The default of 700 means a
+# full young-generation sweep every 700 net allocations, which on a bot
+# handling one message a minute is a sweep every few seconds, forever, over a
+# heap that is almost entirely long-lived. Raising it trades a little peak
+# memory for a lot of pointless scanning.
+GC_THRESHOLD = int(os.environ.get("GC_GEN0_THRESHOLD", "5000"))
+
 
 async def tune_runtime(application) -> None:
-    """Call from each bot's post_init.
+    """Call from each bot's post_init. Three settings, all of them about what
+    an idle-most-of-the-day process costs to keep running.
 
-    asyncio's default executor sizes itself to min(32, cpu_count + 4), and on
-    a shared cloud host cpu_count is the *machine's* core count rather than
-    this container's slice of it. That is up to 32 threads, each with its own
-    stack, standing by for a workload whose peak is a couple of concurrent
-    database calls and one ffmpeg. Four is plenty, and the difference is
-    real resident memory on the smallest plan that fits."""
+    1. asyncio's default executor sizes itself to min(32, cpu_count + 4), and
+       on a shared cloud host cpu_count is the *machine's* core count rather
+       than this container's slice of it. That is up to 32 threads, each with
+       its own stack, standing by for a workload whose peak is a couple of
+       concurrent database calls and one ffmpeg. Four is plenty, and the
+       difference is real resident memory on the smallest plan that fits.
+
+    2. Everything imported at startup -- python-telegram-bot, psycopg, this
+       bot's own modules -- is permanent by definition, and the garbage
+       collector walks all of it on every full collection for the rest of the
+       process's life. gc.freeze() moves it out of the collector's reach
+       entirely. Called here, at the end of startup, because that is the last
+       moment at which "allocated so far" and "will never be freed" mean the
+       same thing.
+
+    3. The collection threshold above.
+
+    (The fourth knob is not settable from inside Python: glibc gives a
+    threaded process up to 8 x cpu_count malloc arenas, each of which can
+    hold on to tens of megabytes it will never hand back. MALLOC_ARENA_MAX
+    caps that, and is set in nixpacks.toml where the runtime environment is.)
+    """
     asyncio.get_running_loop().set_default_executor(
         ThreadPoolExecutor(max_workers=WORKER_THREADS, thread_name_prefix="worker")
     )
+    gc.collect()
+    gc.freeze()
+    gc.set_threshold(GC_THRESHOLD, 20, 20)
 
 
 # ---------------------------------------------------------------------------
@@ -682,11 +713,11 @@ async def finish_cancel_choice(update, context, lang: str, stopped: list[str]) -
     if released and not stopped:
         stopped = [i18n.t(lang, "cancel_item_stale_prompt")]
     text = build_cancel_text(lang, stopped)
-    try:
-        await query.message.edit_text(text)
-    except Exception:
-        logging.getLogger(__name__).debug("Could not edit the cancel menu", exc_info=True)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+    # Through live_message rather than edit_text: if the user has typed
+    # anything since tapping, this report belongs at the bottom of the chat
+    # with their message, not rewritten above it. It handles the send itself,
+    # and never raises, so there is no fallback left to write here.
+    await live_message.edit_in_place(query.message, context.bot, text)
     if had_prompt and not released:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -699,10 +730,9 @@ async def keep_going(update, context, lang: str) -> None:
     """"Keep going" -- the way back out of the question, having changed
     nothing. The menu is replaced rather than left sitting there with live
     buttons under an answer that has already been given."""
-    try:
-        await update.callback_query.message.edit_text(i18n.t(lang, "cancel_kept"))
-    except Exception:
-        logging.getLogger(__name__).debug("Could not edit the cancel menu", exc_info=True)
+    await live_message.edit_in_place(
+        update.callback_query.message, context.bot, i18n.t(lang, "cancel_kept")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -955,11 +985,54 @@ async def track_activity(update, context) -> None:
     per-user cache with the time, which is what lets that same job drop the
     caches of people who have not been seen in a long while."""
     note_network_ok()
+    # Which message is newest in this chat, so a live message knows whether
+    # it is still the last thing on screen. Before the user check on purpose:
+    # it is a property of the chat, not of who sent it.
+    live_message.note_update(update)
     user = update.effective_user
     if not user:
         return
     _activity_buffer.add(user.id)
     context.user_data["_last_seen"] = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Not starting something an update is about to take away
+# ---------------------------------------------------------------------------
+# Two different reasons a bot should decline to begin slow work, and they want
+# different sentences:
+#
+#   A stop signal has already arrived. The container is going in seconds and
+#   there is nothing to arrange -- "send it again in a moment" is the whole
+#   truth, and lifecycle.busy() covers anyone already inside a job.
+#
+#   The owner has announced an update from ParentBot. That can last across
+#   several deploys, so the honest answer carries an estimate and a promise:
+#   the person is written down, and /finishupdates goes back to them when it
+#   is over. Being told "try again in a moment" and finding it still shut
+#   four times running is worse than being told to wait ten minutes once.
+#
+# Every handler that starts something slow calls this first and shows what it
+# returns instead of starting.
+
+async def refuse_new_work(lang: str, user_id: int, chat_id: int) -> str | None:
+    """The sentence to answer with instead of starting slow work, or None
+    when there is no reason not to start it.
+
+    Writes the person down when -- and only when -- the owner has announced
+    an update, because that is the only case where somebody is coming back to
+    tell them it is finished.
+    """
+    if not lifecycle.is_paused():
+        return None
+    if not lifecycle.in_maintenance():
+        return i18n.t(lang, "restarting_send_again")
+
+    await asyncio.to_thread(lifecycle.hold_for_update, user_id, chat_id)
+    minutes = lifecycle.maintenance_minutes_left()
+    if minutes is None:
+        return i18n.t(lang, "update_soon_try_later_soon")
+    return i18n.t(lang, "update_soon_try_later", minutes=minutes)
 
 
 # ---------------------------------------------------------------------------
@@ -1041,6 +1114,84 @@ def detect_host_environment() -> str:
     return f"💻 Local ({socket.gethostname()})"
 
 
+# ---------------------------------------------------------------------------
+# What this process actually costs to run
+# ---------------------------------------------------------------------------
+# A usage-billed host charges for resident memory and CPU seconds, and until
+# this was on /status there was no way to tell whether a change to either had
+# helped, hurt, or done nothing. Every number here is read from the kernel,
+# free, and only when someone asks.
+
+def _read_first_int(path: str, key: str | None = None) -> int | None:
+    try:
+        with open(path) as handle:
+            if key is None:
+                text = handle.read().strip()
+                return int(text) if text.isdigit() else None
+            for line in handle:
+                if line.startswith(key):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _memory_ceiling_bytes() -> int | None:
+    """What the container is allowed, rather than what the host has. cgroup
+    v2 first (every current Linux container runtime), then v1."""
+    for path, scale in (("/sys/fs/cgroup/memory.max", 1),
+                        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", 1)):
+        value = _read_first_int(path)
+        # An unset cgroup limit is reported as a number near 2^63, which is
+        # "the whole machine" and worth nothing as a denominator.
+        if value and value < (1 << 62):
+            return value * scale
+    return None
+
+
+def _mb(value_bytes: float) -> str:
+    return f"{value_bytes / (1024 * 1024):.0f} MB"
+
+
+def process_footprint() -> str:
+    """One line: resident memory, its high-water mark, and CPU seconds burned
+    since startup. Read /proc where it exists (Linux, which is what the
+    deployed containers are) and fall back to getrusage elsewhere."""
+    parts = []
+
+    resident = _read_first_int("/proc/self/status", "VmRSS:")
+    peak = _read_first_int("/proc/self/status", "VmHWM:")
+    if resident is not None:
+        line = f"Memory: {_mb(resident * 1024)} resident"
+        if peak:
+            line += f" (peak {_mb(peak * 1024)})"
+        ceiling = _memory_ceiling_bytes()
+        if ceiling:
+            line += f" of {_mb(ceiling)} allowed"
+        parts.append(line)
+    else:
+        try:
+            import resource
+
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            # ru_maxrss is kilobytes on Linux and bytes on macOS/BSD.
+            scale = 1 if sys.platform == "darwin" else 1024
+            parts.append(f"Memory: peak {_mb(usage.ru_maxrss * scale)}")
+        except Exception:
+            pass
+
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        cpu = usage.ru_utime + usage.ru_stime
+        parts.append(f"CPU: {cpu:.0f}s used since start")
+    except Exception:
+        pass
+
+    return " · ".join(parts) or "Footprint: not readable on this host"
+
+
 def build_status_text(start_time: datetime, users_last_hour: int, users_since_start: int) -> str:
     now = datetime.now(timezone.utc)
     uptime = now - start_time
@@ -1054,6 +1205,7 @@ def build_status_text(start_time: datetime, users_last_hour: int, users_since_st
         f"Hosted: {detect_host_environment()}",
         f"Active users (last hour): {users_last_hour}",
         f"Active users (since this start): {users_since_start}",
+        process_footprint(),
         "",
         error_summary(),
     ])

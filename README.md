@@ -86,6 +86,19 @@ pass, which is easier than doing five of these separately.
    variables on the service.
 3. Deploy — `pip install -r requirements.txt` then `python bot.py`.
 
+### Updating a running bot
+
+Pushing an update replaces the container, and the bots are set up so nobody
+notices: the new process waits on a Postgres advisory lock until the old one
+has stopped polling (no 409 Conflict, no split updates), open conversations
+and half-finished sessions are restored from the `runtime_state` table in
+this bot's own schema, and anyone whose upload was mid-flight is told to send
+it again rather than left waiting. Updates sent during the gap are held by
+Telegram and delivered on the first poll.
+
+`../UPDATES.md` has the whole picture, including what to check after a push.
+`DEPLOY_SAFETY=off` turns all of it off and restores the old behaviour.
+
 ## Keeping a local and cloud database in sync
 
 If you ever run this bot from both your laptop and the cloud at different
@@ -112,6 +125,10 @@ cosmetic (display text + link buttons); no database or file is shared.
 - `db.py` — this bot's own Postgres schema and queries
 - `family_link.py` — heartbeats, crash reporting, and the queue ParentBot
   uses to run this bot's owner-only commands (identical in every bot)
+- `live_message.py` — the rule that a bot message only keeps evolving while
+  it is still the last thing in the chat (identical in every bot)
+- `lifecycle.py` — surviving a redeploy: one poller at a time, state kept in
+  Postgres, in-flight work announced (identical in every bot)
 - `shared_features.py` — `/donate` (Telegram Stars) + sibling-bot cross-promotion
 - `video.py` — the yt-dlp video download (Instagram/TikTok/YouTube, and
   Reddit/Twitter video posts)

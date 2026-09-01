@@ -282,6 +282,25 @@ def count_active_users_since(since) -> int:
         return cur.fetchone()[0]
 
 
+def list_all_users() -> list[int]:
+    """Everyone this bot could send an unprompted message to.
+
+    The union of two tables because neither is the whole answer on its own:
+    settings has a row per person who has ever picked a setting and is never
+    pruned, while activity_events reaches people who only ever used the bot
+    without changing anything -- but is pruned at ACTIVITY_RETENTION_DAYS.
+    Together they are "everyone we still know about", which is the honest
+    scope of a broadcast.
+    """
+    with pooled() as conn:
+        cur = conn.execute(
+            "SELECT user_id FROM settings "
+            "UNION "
+            "SELECT DISTINCT user_id FROM activity_events"
+        )
+        return [int(r[0]) for r in cur.fetchall()]
+
+
 def get_caption_enabled(user_id: int) -> bool:
     with pooled() as conn:
         cur = conn.execute("SELECT caption_enabled FROM settings WHERE user_id = %s", (user_id,))

@@ -29,6 +29,37 @@ MAX_DURATION_S = int(os.environ.get("DBOT_MAX_DURATION_SECONDS", "1800"))
 SOCKET_TIMEOUT_S = int(os.environ.get("DBOT_SOCKET_TIMEOUT", "30"))
 
 
+# YouTube asks a server to prove it is not a bot, and a cloud host's IP is
+# exactly what makes it ask. There is no fix for this in the bot, only
+# mitigations, and which one works changes month to month -- so both are env
+# vars with sensible defaults rather than decisions baked into the code.
+#
+# player_client picks which of YouTube's own clients yt-dlp pretends to be.
+# They are gated differently and the gating moves; yt-dlp tries these in
+# order and the list is worth revisiting whenever downloads start failing.
+YT_PLAYER_CLIENTS = [
+    c.strip() for c in
+    os.environ.get("DBOT_YT_PLAYER_CLIENTS", "tv,web_safari,android_vr,web").split(",")
+    if c.strip()
+]
+
+# A cookies.txt exported from a logged-in browser is the reliable answer, and
+# it is deliberately not the default: it ties this bot to a real Google
+# account, the cookies expire in days, and the account can be banned for it.
+# If you use one, use a throwaway account -- never your own.
+YT_COOKIEFILE = os.environ.get("DBOT_COOKIES_FILE") or None
+
+# What the "sign in to confirm you're not a bot" wall looks like coming back
+# out of yt-dlp. Matched so the user gets a sentence instead of a stack of
+# yt-dlp's documentation links.
+BOT_CHECK_MARKERS = ("sign in to confirm", "confirm you're not a bot",
+                     "confirm you are not a bot")
+
+
+class BlockedBySource(Exception):
+    """The site refused the server, not the link. Message is user-facing."""
+
+
 class TooLarge(Exception):
     """The clip is over the size/duration ceiling. Message is user-facing."""
 
@@ -50,6 +81,42 @@ def _reject_long(info, *, incomplete):
     return None
 
 
+# Every branch below either is a muxed stream (`b`, which by definition has
+# both) or explicitly merges video with audio (`+ba`). That sounds obvious and
+# it is the whole bug this replaced:
+#
+#     best[filesize<48M]/best[filesize_approx<48M]/mp4/bestvideo+bestaudio/best
+#
+# A bare `mp4` in a yt-dlp format chain means "the best format whose extension
+# is mp4", and on YouTube the best standalone mp4 is a *video-only* DASH
+# stream. It sat ahead of `bestvideo+bestaudio`, so it won whenever the two
+# filesize branches missed -- and on YouTube they miss almost always, because
+# DASH formats report `filesize: None` and a format whose size is unknown
+# *fails* `[filesize<48M]` rather than passing it. Instagram and TikTok hand
+# back muxed streams with known sizes, so the chain never reached the bad
+# branch there. The result was a bug that only existed on one platform and
+# only showed up after the download had already succeeded.
+#
+# The size filters are kept because downloading 400 MB to throw it away is
+# worse than picking a smaller stream, but they are now applied to the video
+# half of a merge rather than being the only thing standing between the bot
+# and a silent file.
+
+def _format_selector(max_mb: int | None = None) -> str:
+    mb = MAX_DOWNLOAD_MB if max_mb is None else max_mb
+    return (
+        # A video stream that fits, plus the best audio, merged.
+        f"bv*[filesize<{mb}M]+ba/"
+        f"bv*[filesize_approx<{mb}M]+ba/"
+        # Or a single already-muxed stream that fits.
+        f"b[filesize<{mb}M]/"
+        f"b[filesize_approx<{mb}M]/"
+        # Nothing advertised a size it could keep to: take the best merge, or
+        # the best muxed stream, and let max_filesize stop it if it runs long.
+        "bv*+ba/b"
+    )
+
+
 def download_video(url: str, out_dir: str) -> str:
     """Downloads the video at `url` into `out_dir`, returns the local file path.
 
@@ -63,13 +130,7 @@ def download_video(url: str, out_dir: str) -> str:
 
     ydl_opts = {
         "outtmpl": outtmpl,
-        # Prefer a stream that already fits rather than downloading the
-        # largest one available and discovering it doesn't.
-        "format": (
-            f"best[filesize<{MAX_DOWNLOAD_MB}M]/"
-            f"best[filesize_approx<{MAX_DOWNLOAD_MB}M]/"
-            "mp4/bestvideo+bestaudio/best"
-        ),
+        "format": _format_selector(),
         "max_filesize": MAX_DOWNLOAD_MB * 1024 * 1024,
         "match_filter": _reject_long,
         "socket_timeout": SOCKET_TIMEOUT_S,
@@ -82,9 +143,21 @@ def download_video(url: str, out_dir: str) -> str:
         # directory this process would otherwise keep growing.
         "cachedir": False,
         "merge_output_format": "mp4",
+        "extractor_args": {"youtube": {"player_client": YT_PLAYER_CLIENTS}},
     }
+    if YT_COOKIEFILE and os.path.exists(YT_COOKIEFILE):
+        ydl_opts["cookiefile"] = YT_COOKIEFILE
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        try:
+            info = ydl.extract_info(url, download=True)
+        except Exception as exc:
+            lowered = str(exc).lower()
+            if any(marker in lowered for marker in BOT_CHECK_MARKERS):
+                # Nothing the user did is wrong and nothing they can do
+                # will help, so the answer says so plainly rather than
+                # handing them yt-dlp's advice about exporting cookies.
+                raise BlockedBySource(str(exc)) from exc
+            raise
         if info is None:
             # match_filter rejected it -- the reason is already in the log,
             # and there is no file to hand back.

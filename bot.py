@@ -84,7 +84,7 @@ from db import (
     dump_database_csv_zip,
     count_active_users_since,
 )
-from video import download_video, TooLarge
+from video import download_video, BlockedBySource, TooLarge
 from shared_features import (
     refuse_new_work,
     attach_maintenance,
@@ -620,6 +620,14 @@ async def _download_and_send_video(update: Update, context: ContextTypes.DEFAULT
         except TooLarge as exc:
             await status.set(context.bot, str(exc))
             return
+        except BlockedBySource:
+            # The site turned the *server* away. Nothing the user did is
+            # wrong and nothing they can do will help, so they get a
+            # sentence rather than yt-dlp's advice about exporting
+            # cookies from a browser they are not using.
+            logger.warning("Blocked by the source site: %s", url)
+            await status.set(context.bot, i18n.t(lang, "source_blocked_server"))
+            return
         except Exception as exc:
             logger.exception("Video download failed")
             await status.set(context.bot, i18n.t(lang, "download_failed", error=exc))
@@ -760,6 +768,20 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not detected:
         return
     platform, url = detected
+
+    # Asked once, here, for every platform. The gate used to live inside
+    # _download_and_send_video only -- which covers Instagram, TikTok and
+    # YouTube, and misses the three paths that fetch an image and send it
+    # without ever reaching that function: a Pinterest pin, a Reddit image
+    # post and a Twitter photo set all sailed straight through an announced
+    # update. They are quicker than a video download, but "quick" is not the
+    # test: a redeploy lands whenever it lands, and a fetch that started
+    # ten seconds before it ends in silence exactly the same way.
+    lang = await i18n.get_lang(update.effective_user.id, context)
+    refusal = await refuse_new_work(lang, update.effective_user.id, update.effective_chat.id)
+    if refusal:
+        await update.message.reply_text(refusal)
+        return
 
     if platform in ("instagram_tiktok", "youtube"):
         await _download_and_send_video(update, context, url)

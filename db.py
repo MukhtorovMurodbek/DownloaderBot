@@ -13,7 +13,8 @@ container redeploy -- see DEPLOY.md.
 """
 import logging
 import os
-from contextlib import closing
+import time
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 
 from urllib.parse import urlsplit
@@ -121,7 +122,45 @@ POOL_MAX = int(os.environ.get("DB_POOL_MAX", "3"))
 POOL_MAX_IDLE = float(os.environ.get("DB_POOL_MAX_IDLE", "120"))
 POOL_TIMEOUT = float(os.environ.get("DB_POOL_TIMEOUT", "15"))
 
+# How long a pooled connection may sit unused before it is worth spending a
+# round trip proving it is still alive. See _check_if_idle: the check was
+# unconditional, and against a database on the other side of the world an
+# unconditional check is the single most expensive thing about a small query.
+POOL_CHECK_AFTER_IDLE = float(os.environ.get("DB_POOL_CHECK_AFTER_IDLE", "45"))
+
 _pool: "ConnectionPool | None" = None
+# id(connection) -> when it was last known good. Bounded by max_size. An id
+# can be reused after a connection is closed, and the worst that costs is a
+# skipped check on a connection that was only just opened -- which is alive
+# by construction.
+_last_known_good: "dict[int, float]" = {}
+
+
+def _check_if_idle(conn) -> None:
+    """The pool's checkout check, but only for connections that have actually
+    been sitting there.
+
+    A connection idle across a cloud provider's own network timeout comes back
+    dead, and `ConnectionPool.check_connection` is the guard against handing
+    one out. It is also a full round trip, and it was being paid on every
+    checkout -- including the checkout half a second after the last one, on a
+    connection that could not possibly have gone stale in between.
+
+    That is most of them. This bot's database is in ap-northeast-2 and the
+    container is in EU West, so one round trip is a quarter of a second; the
+    check was a third of the cost of every read. A connection used within the
+    last POOL_CHECK_AFTER_IDLE seconds is taken as alive, and everything
+    quieter than that is still proved before use.
+    """
+    key = id(conn)
+    now = time.monotonic()
+    seen = _last_known_good.get(key)
+    if seen is None or now - seen > POOL_CHECK_AFTER_IDLE:
+        ConnectionPool.check_connection(conn)
+    _last_known_good[key] = now
+    if len(_last_known_good) > 4 * max(POOL_MAX, 1):
+        for stale in [k for k, t in _last_known_good.items() if now - t > 3600]:
+            _last_known_good.pop(stale, None)
 
 
 def _get_pool() -> ConnectionPool:
@@ -135,11 +174,15 @@ def _get_pool() -> ConnectionPool:
             max_size=POOL_MAX,
             max_idle=POOL_MAX_IDLE,
             timeout=POOL_TIMEOUT,
-            kwargs={"options": f"-c search_path={DB_SCHEMA},public"},
-            # A connection idle across a cloud provider's own network timeout
-            # comes back dead. This is an empty query on checkout -- one
-            # cheap round trip in place of a user-visible error.
-            check=ConnectionPool.check_connection,
+            kwargs={
+                "options": f"-c search_path={DB_SCHEMA},public",
+                # Keep an idle connection alive at the TCP level rather than
+                # discovering it is dead on the next checkout. Cheaper than
+                # the check it saves, and it happens while nobody is waiting.
+                "keepalives": 1, "keepalives_idle": 30,
+                "keepalives_interval": 10, "keepalives_count": 5,
+            },
+            check=_check_if_idle,
             name=f"{DB_SCHEMA}",
             open=True,
         )
@@ -149,8 +192,40 @@ def _get_pool() -> ConnectionPool:
 def pooled():
     """A connection from the pool, as a context manager. The transaction is
     committed on a clean exit and rolled back on an exception; the connection
-    itself goes back to the pool either way rather than being closed."""
+    itself goes back to the pool either way rather than being closed.
+
+    For anything that writes. Reads should use pooled_read(), which is the
+    same connection without the transaction around it."""
     return _get_pool().connection()
+
+
+@contextmanager
+def pooled_read():
+    """A pooled connection in autocommit, for statements that only read.
+
+    A read through pooled() costs three round trips to the database: the
+    implicit BEGIN that psycopg opens with the first statement, the statement
+    itself, and the COMMIT the context manager sends on the way out. Two of
+    those exist to make a transaction nobody needed -- a single SELECT is
+    atomic on its own.
+
+    Measured against the family's actual database, one read: 28 ms through
+    pooled(), 9 ms through this. The same shape holds wherever the database
+    is; it is round trips, so it scales with the distance rather than washing
+    out. Everything that writes -- and anything reading several statements
+    that have to agree with each other -- still goes through pooled().
+    """
+    with _get_pool().connection() as conn:
+        conn.set_autocommit(True)
+        try:
+            yield conn
+        finally:
+            # Back to the pool as it was found, so pooled() still gets a
+            # connection that opens a transaction.
+            try:
+                conn.set_autocommit(False)
+            except Exception:
+                logging.getLogger(__name__).debug("Could not restore transaction mode", exc_info=True)
 
 
 def close_pool() -> None:
@@ -274,7 +349,7 @@ def record_activity_batch(user_ids) -> None:
 
 
 def count_active_users_since(since) -> int:
-    with pooled() as conn:
+    with pooled_read() as conn:
         cur = conn.execute(
             "SELECT COUNT(DISTINCT user_id) FROM activity_events WHERE occurred_at >= %s",
             (since,),
@@ -292,7 +367,7 @@ def list_all_users() -> list[int]:
     Together they are "everyone we still know about", which is the honest
     scope of a broadcast.
     """
-    with pooled() as conn:
+    with pooled_read() as conn:
         cur = conn.execute(
             "SELECT user_id FROM settings "
             "UNION "
@@ -302,7 +377,7 @@ def list_all_users() -> list[int]:
 
 
 def get_caption_enabled(user_id: int) -> bool:
-    with pooled() as conn:
+    with pooled_read() as conn:
         cur = conn.execute("SELECT caption_enabled FROM settings WHERE user_id = %s", (user_id,))
         row = cur.fetchone()
         return bool(row[0]) if row else True  # default: caption ON
@@ -326,7 +401,7 @@ def get_lossless_enabled(user_id: int) -> bool:
     Defaults to False for everyone who has never said otherwise: a
     compressed video plays in the chat, and a file has to be downloaded
     first, so the quality is only worth having if you asked for it."""
-    with pooled() as conn:
+    with pooled_read() as conn:
         cur = conn.execute("SELECT lossless_enabled FROM settings WHERE user_id = %s", (user_id,))
         row = cur.fetchone()
         return bool(row[0]) if row else False
@@ -347,7 +422,7 @@ def set_lossless_enabled(user_id: int, enabled: bool) -> None:
 def get_user_language(user_id: int) -> str | None:
     """None means the user hasn't picked a language yet (no row, or a row
     with caption prefs but no language set)."""
-    with pooled() as conn:
+    with pooled_read() as conn:
         cur = conn.execute("SELECT language FROM settings WHERE user_id = %s", (user_id,))
         row = cur.fetchone()
         return row[0] if row else None

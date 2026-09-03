@@ -3,16 +3,46 @@
 Telegram bot that downloads media from a pasted link and sends it back — no
 command needed, just paste a link.
 
-- **Instagram / TikTok**: video, via yt-dlp.
-- **Pinterest**: the pin's image straight off its public page (no login) —
-  falls back to yt-dlp for video pins.
-- **Reddit**: media posts download directly; text/link posts get rendered
-  as a clean image "card" instead of a wall of text.
-- **Twitter/X**: same split as Reddit — media, or a card for text tweets.
+- **Instagram**: reels, photo posts and carousels.
+- **TikTok**: videos without the watermark, and photo slideshows.
+- **Twitter/X**: video and photos; a text-only tweet becomes a clean image
+  "card" instead of a wall of text.
+- **Pinterest**: the pin's image at full resolution, or the video for a
+  video pin.
+- **Reddit**: media posts download directly; text/link posts get a card.
 
-See `platforms.py` for how each of those works (and their honest
-limitations — Reddit's anti-scraping and X's endpoint stability both
-matter here) and `cards.py` for the card renderer.
+## How it gets them, and why that took a rewrite
+
+Instagram and YouTube decide what to serve partly from **where** the request
+comes from. Every cloud host's address sits in a published datacenter range,
+and those ranges get a login page where a phone gets the post. Until v1.2.1
+this bot had exactly one way to fetch anything — yt-dlp, from inside its own
+container — so Instagram stopped working entirely and said so politely.
+
+`resolvers.py` fixes that by not making the request from here. Each platform
+has a **chain of independent routes**, mostly public services that fetch on
+their own infrastructure and hand back either a direct CDN link or a copy
+proxied through themselves; whether this container is on a blocked range
+stops mattering. yt-dlp is still in every chain, but last, because it is the
+one route that goes out from this address — and the only one that gets better
+the moment a cookie file or proxy is configured.
+
+Any one of those services is mortal: they get bought, rate-limited, sued, or
+simply stop resolving in DNS. So the bot keeps score. Every attempt is
+recorded per route in its own `provider_health` table, a route that keeps
+failing is moved to the back of its chain and retried more and more rarely
+(never dropped — a chain where everything is resting still tries everything),
+and a single success puts it straight back at the front. Nothing needs a
+human to notice a service has died.
+
+- `/providers` (owner-only) — what the live bot has learned from real traffic.
+- `python probe.py` — asks every route on demand, from wherever you run it.
+  Note that the answer depends on the network you run it from, which is the
+  whole point.
+
+Read `resolvers.py`'s docstring before changing any of it. `platforms.py` is
+now just link recognition plus the two page reads that feed the cards, and
+`cards.py` is the card renderer.
 
 This bot is its own process, its own repo and its own deployment — it can
 be run entirely on its own. It shares one Postgres database with the rest
@@ -52,6 +82,8 @@ everyone else):
 - `/messageas <user_id> <text>` — send a message to that user as this bot
 - `/dbdump` — export this bot's tables as a zip of CSVs
 - `/status` — uptime, host, crashes since this process started, active users
+- `/providers` — which download route is currently working, per platform,
+  with the failure streak and last error for the ones that are not
 
 ## Setup
 

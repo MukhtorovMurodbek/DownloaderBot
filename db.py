@@ -146,11 +146,14 @@ def _check_if_idle(conn) -> None:
     checkout -- including the checkout half a second after the last one, on a
     connection that could not possibly have gone stale in between.
 
-    That is most of them. This bot's database is in ap-northeast-2 and the
-    container is in EU West, so one round trip is a quarter of a second; the
-    check was a third of the cost of every read. A connection used within the
-    last POOL_CHECK_AFTER_IDLE seconds is taken as alive, and everything
-    quieter than that is still proved before use.
+    That is most of them. It cost a quarter of a second each back when this
+    bot's database was in ap-northeast-2 and the container in EU West -- a
+    third of the cost of every read. Since v1.2.0 the database is in
+    eu-central-1, beside the containers, which cuts the absolute cost by an
+    order of magnitude but leaves the ratio alone: the check is still a whole
+    extra round trip per read. A connection used within the last
+    POOL_CHECK_AFTER_IDLE seconds is taken as alive, and everything quieter
+    than that is still proved before use.
     """
     key = id(conn)
     now = time.monotonic()
@@ -325,6 +328,26 @@ def init_db(dsn: str = DATABASE_URL) -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_activity_events_occurred_at ON activity_events (occurred_at)"
+        )
+        # Which download provider is currently working, and which is not.
+        #
+        # Kept in the database rather than in memory alone so a redeploy does
+        # not go back to hammering a service that has been dead for a week --
+        # a container that restarts every time the owner ships would otherwise
+        # re-learn the same lesson from scratch, at a user's expense, several
+        # times a day. See resolvers.py.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provider_health (
+                provider TEXT PRIMARY KEY,
+                ok_count BIGINT NOT NULL DEFAULT 0,
+                fail_count BIGINT NOT NULL DEFAULT 0,
+                consecutive_fails INTEGER NOT NULL DEFAULT 0,
+                last_ok_at DOUBLE PRECISION,
+                last_fail_at DOUBLE PRECISION,
+                last_error TEXT
+            )
+            """
         )
         conn.commit()
 
@@ -521,6 +544,51 @@ def reset_donation_prompt(user_id: int) -> None:
 # grows without limit, which on a metered database is a bill that only ever
 # goes up. family_link.py's housekeeping job calls this.
 ACTIVITY_RETENTION_DAYS = int(os.environ.get("ACTIVITY_RETENTION_DAYS", "90"))
+
+
+# ---------- download provider health (resolvers.py) ----------
+
+def load_provider_health() -> list[dict]:
+    """Everything known at startup. Returns plain dicts so resolvers.py does
+    not have to know what a psycopg row looks like."""
+    with pooled_read() as conn:
+        rows = conn.execute(
+            "SELECT provider, ok_count, fail_count, consecutive_fails, "
+            "last_ok_at, last_fail_at, last_error FROM provider_health"
+        ).fetchall()
+    cols = ("provider", "ok_count", "fail_count", "consecutive_fails",
+            "last_ok_at", "last_fail_at", "last_error")
+    return [dict(zip(cols, row)) for row in rows]
+
+
+def save_provider_health(rows: list[tuple]) -> None:
+    """Upsert the counters that changed since the last flush.
+
+    One statement for the whole batch, on a timer, rather than a write per
+    download -- the same bargain activity_events makes, and for the same
+    reason: this is advice about which provider to try first, not user data,
+    and it is not worth a round trip each time somebody pastes a link.
+    """
+    if not rows:
+        return
+    with pooled() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO provider_health (provider, ok_count, fail_count,
+                        consecutive_fails, last_ok_at, last_fail_at, last_error)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (provider) DO UPDATE SET
+                    ok_count = EXCLUDED.ok_count,
+                    fail_count = EXCLUDED.fail_count,
+                    consecutive_fails = EXCLUDED.consecutive_fails,
+                    last_ok_at = EXCLUDED.last_ok_at,
+                    last_fail_at = EXCLUDED.last_fail_at,
+                    last_error = EXCLUDED.last_error
+                """,
+                rows,
+            )
+        conn.commit()
 
 
 def prune_old_data() -> int:

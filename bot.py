@@ -1,48 +1,45 @@
 """
 Media downloader bot -- 4th bot in the family (see ARCHITECTURE.md).
-Started as Instagram/TikTok video-only; now also handles Pinterest,
-Reddit, and Twitter/X.
 
 Commands:
   /start, /help   - greeting + how it works
-  /caption on|off - toggle the "⬇️ via @thisbot" credit caption
+  /caption on|off - toggle the "via @thisbot" credit caption
+  /lossless on|off- send downloads as uncompressed files
   /donate         - support hosting costs (voluntary)
   /en, /uz, /rus  - switch language (English/Uzbek/Russian); also asked
                     once, trilingually, on first /start
+  /providers      - owner-only: which download route is currently working
 
-Paste a link at any time (no command needed):
-  - Instagram / TikTok / YouTube*: video, via yt-dlp (video.py, unchanged).
-  - Pinterest: a single pin's image, straight off its public og:image tag
-    (no login needed) -- falls back to yt-dlp for video pins.
-  - Reddit: media posts go through yt-dlp same as above (or a direct image
-    fetch for plain image posts); text/link posts get rendered as a clean
-    "card" image (platforms.py + cards.py) instead of just a wall of text --
-    that's the actual point of downloading one of these instead of just
-    screenshotting it.
-  - Twitter/X: same split -- photos/video via X's own public syndication
-    endpoint (what its embed widget already uses, no login) or yt-dlp for
-    video; text tweets become a card. Best-effort: X can rate-limit or
-    change that endpoint without notice, so this quietly falls back to
-    just handing back the link rather than erroring at the user.
+Paste a link at any time (no command needed). Instagram, TikTok, Twitter/X,
+Pinterest and Reddit all go through resolvers.py, which tries several
+independent ways of getting the media and remembers which ones work -- read
+that file's docstring first, because the reason it exists (a datacenter IP
+gets a login page where a phone gets the post) is the single most important
+thing to know about this bot.
 
-*YouTube is deliberately not mentioned in /help, /start, or the bot's
-command menu (BOT_COMMANDS below) -- it's handled if pasted (same yt-dlp
-path as everything else here) but never advertised, on purpose. Don't
-"helpfully" add it to the help text later without checking with the repo
-owner first -- see platforms.py's YOUTUBE_RE for why.
+Reddit and Twitter/X keep one thing resolvers.py does not do: a post with no
+media in it is rendered as a clean card image (cards.py) instead of a wall of
+text, which is the actual point of "downloading" one of those.
+
+YouTube is deliberately not mentioned in /help, /start, or the bot's command
+menu (BOT_COMMANDS below) -- it is handled if pasted but never advertised. It
+is also the one platform with no route but yt-dlp, so it is the one most
+likely to be refusing this server on any given day; advertising it would be
+promising something the bot cannot keep. Don't "helpfully" add it to the help
+text later without checking with the repo owner first.
 
 Requires: python-telegram-bot[job-queue]>=21.3, yt-dlp>=2024.1, httpx,
           Pillow, python-dotenv>=1.0
 Env vars: DBOT_TOKEN, DBOT_USERNAME (no @), DBOT_ADMIN_ID (optional,
-          comma-separated, gates /messageas, /dbdump and /status),
+          comma-separated, gates /messageas, /dbdump, /status, /providers),
           DATABASE_URL and DB_SCHEMA (the shared family database, and this
-          bot's schema in it), SIBLING_BOTS. Download limits and concurrency
-          are documented in .env.example.
+          bot's schema in it), SIBLING_BOTS. Download limits, concurrency and
+          the per-site cookie/proxy settings are documented in .env.example.
 """
 import asyncio
 import logging
 import os
-import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -53,8 +50,8 @@ except ImportError:
     pass
 
 from telegram import (
-    BotCommand, InputMediaDocument, InputMediaPhoto, LinkPreviewOptions, Update,
-    InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand, InputMediaDocument, InputMediaPhoto, InputMediaVideo,
+    LinkPreviewOptions, Update, InlineKeyboardButton, InlineKeyboardMarkup,
 )
 
 # For any message whose text is an error. yt-dlp's failures quote their own
@@ -78,7 +75,9 @@ import cards
 import family_link
 import i18n
 import lifecycle
+import net
 import platforms
+import resolvers
 from live_message import LiveMessage, edit_in_place
 from db import (
     init_db,
@@ -90,8 +89,9 @@ from db import (
     set_user_language,
     dump_database_csv_zip,
     count_active_users_since,
+    load_provider_health,
+    save_provider_health,
 )
-from video import download_video, BlockedBySource, TooLarge
 from shared_features import (
     refuse_new_work,
     attach_maintenance,
@@ -509,6 +509,72 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(build_status_text(START_TIME, users_hour, users_since_start))
 
 
+# How often the in-memory provider scores are written to Postgres. A minute
+# is short enough that a crash loses nothing that matters and long enough that
+# a busy hour is sixty writes rather than a write per download. See
+# resolvers.take_dirty().
+PROVIDER_HEALTH_FLUSH_SECONDS = int(
+    os.environ.get("DBOT_PROVIDER_FLUSH_SECONDS", "60"))
+
+
+async def _flush_provider_health(_context=None) -> None:
+    dirty = resolvers.take_dirty()
+    if not dirty:
+        return
+    rows = [(name, h.ok, h.failed, h.streak, h.last_ok, h.last_fail, h.last_error)
+            for name, h in dirty.items()]
+    try:
+        await asyncio.to_thread(save_provider_health, rows)
+    except Exception:
+        # Scores are advice, not user data. If the database is unreachable the
+        # bot carries on choosing providers from memory rather than failing a
+        # download over a bookkeeping write.
+        logger.warning("couldn't save provider health", exc_info=True)
+
+
+async def providers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/providers -- which download route is working and which is not.
+
+    Owner-only, same reasoning as /dbdump and /status: operational detail, and
+    left in English like the rest of the admin output. This is the command
+    that answers "Instagram broke again, what happened" without reading logs.
+    """
+    if not _is_admin(update.effective_user.id):
+        return await _deny(update, context)
+    now = time.time()
+    lines = []
+    for platform, chain in resolvers.PROVIDERS.items():
+        lines.append(f"\n{platform}:")
+        for name, _fn in chain:
+            h = resolvers.health(name)
+            if h.ok == 0 and h.failed == 0:
+                lines.append(f"  \u2022 {name} -- not tried yet")
+                continue
+            if h.streak == 0 and h.ok:
+                mark, note = "\u2705", f"last ok {_ago(now - (h.last_ok or now))} ago"
+            elif h.cooling_until > now:
+                mark = "\u274c"
+                note = (f"{h.streak} in a row, resting "
+                        f"{_ago(h.cooling_until - now)}: {h.last_error}")
+            else:
+                mark, note = "\u26a0\ufe0f", f"{h.streak} in a row: {h.last_error}"
+            lines.append(f"  {mark} {name} -- {h.ok} ok / {h.failed} failed, {note}")
+    await update.message.reply_text(
+        "Download routes, best first per platform:" + "\n".join(lines),
+        **NO_PREVIEW)
+
+
+def _ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60}m"
+    if seconds < 172800:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
 def _nudge_kb() -> InlineKeyboardMarkup | None:
     # Point at ConvertBot too -- e.g. someone might want just the audio, or
     # a gif, out of what they just downloaded. No file handoff between bots
@@ -556,12 +622,83 @@ async def _reply_image(update: Update, data: bytes, stem: str, reply_markup=None
     return await update.message.reply_photo(BytesIO(data), reply_markup=reply_markup)
 
 
-async def _download_and_send_video(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, status=None):
-    """The original Instagram/TikTok path (video.py, unmodified) -- also
-    reused for YouTube, and as the fallback for Pinterest/Reddit/Twitter
-    video posts. Reuses an existing status message if one's passed in,
-    instead of adding a second "Downloading..." on top of whatever the
-    caller already showed."""
+async def _send_media(update, context, items_with_paths, lang) -> None:
+    """Put what was resolved into the chat.
+
+    One file goes as a photo or a video so it plays inline; several go as an
+    album, in Telegram's own maximum of ten per group. Under /lossless every
+    one of them goes as a document instead -- see lossless_toggle for the
+    whole argument, and note `disable_content_type_detection`, without which
+    the Bot API sniffs an uploaded .mp4, decides it is really a video, and
+    delivers it re-encoded, which is the entire thing that branch exists to
+    avoid.
+    """
+    caption = None
+    if await asyncio.to_thread(get_caption_enabled, update.effective_user.id):
+        caption = i18n.t(lang, "download_credit_caption", username=BOT_USERNAME)
+    lossless = await asyncio.to_thread(get_lossless_enabled, update.effective_user.id)
+
+    if len(items_with_paths) == 1:
+        item, path = items_with_paths[0]
+        # Streamed from disk by python-telegram-bot rather than read into
+        # memory here first.
+        with open(path, "rb") as f:
+            if lossless:
+                await update.message.reply_document(
+                    f, filename=os.path.basename(item.filename or path),
+                    caption=caption, reply_markup=_nudge_kb(),
+                    read_timeout=120, write_timeout=120,
+                    disable_content_type_detection=True,
+                )
+            elif item.kind == "video":
+                await update.message.reply_video(
+                    f, caption=caption, reply_markup=_nudge_kb(),
+                    read_timeout=120, write_timeout=120,
+                )
+            else:
+                await update.message.reply_photo(
+                    f, caption=caption, reply_markup=_nudge_kb(),
+                    read_timeout=120, write_timeout=120,
+                )
+        return
+
+    # An album. The caption rides on the first item of the first group, which
+    # is where Telegram shows an album's caption.
+    for chunk_start in range(0, len(items_with_paths), 10):
+        chunk = items_with_paths[chunk_start:chunk_start + 10]
+        handles = [open(path, "rb") for _, path in chunk]
+        try:
+            group = []
+            for n, ((item, path), handle) in enumerate(zip(chunk, handles)):
+                cap = caption if (chunk_start == 0 and n == 0) else None
+                if lossless:
+                    group.append(InputMediaDocument(
+                        handle, filename=os.path.basename(item.filename or path),
+                        caption=cap, disable_content_type_detection=True))
+                elif item.kind == "video":
+                    group.append(InputMediaVideo(handle, caption=cap))
+                else:
+                    group.append(InputMediaPhoto(handle, caption=cap))
+            await update.message.reply_media_group(
+                group, read_timeout=120, write_timeout=120)
+        finally:
+            for handle in handles:
+                handle.close()
+
+
+async def _resolve_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            platform: str, url: str, status=None,
+                            quiet_if_missing: bool = False) -> bool:
+    """The whole download path: pick a route that is working, fetch, send.
+
+    Returns True if something was delivered. On failure the user has already
+    been told, with one exception: `quiet_if_missing` says the caller has a
+    better answer than an error for a post with no media in it -- a text
+    tweet, which becomes a card instead.
+
+    Reuses an existing status message if one is passed in, instead of stacking
+    a second "Fetching..." on top of whatever the caller already showed.
+    """
     lang = await i18n.get_lang(update.effective_user.id, context)
     # A download outlasts the shutdown grace period, so starting one now would
     # end in silence. A few seconds' wait beats a lost file.
@@ -573,111 +710,69 @@ async def _download_and_send_video(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text(refusal)
         else:
             await status.set(context.bot, refusal)
-        return
-    if status is None:
-        status = await LiveMessage.reply_to(update.message, i18n.t(lang, "downloading"))
-    else:
-        await status.set(context.bot, i18n.t(lang, "downloading"))
+        return False
 
-    # Say so rather than leaving them watching a "Downloading..." that has not
-    # actually started yet. Only edited back afterwards if it was shown --
-    # editing a message to the text it already has is a Telegram error.
-    queued = _slots().locked()
-    if queued:
+    if status is None:
+        status = await LiveMessage.reply_to(update.message, i18n.t(lang, "fetching"))
+    else:
+        await status.set(context.bot, i18n.t(lang, "fetching"))
+
+    # Say so rather than leaving them watching a "Fetching..." that has not
+    # actually started yet.
+    if _slots().locked():
         await status.set(context.bot, i18n.t(lang, "queued"))
 
-    path = None
-    async with _slots(), lifecycle.busy(update.effective_chat.id, i18n.t(lang, "restarting_send_again")):
+    paths: list[str] = []
+    async with _slots(), lifecycle.busy(update.effective_chat.id,
+                                        i18n.t(lang, "restarting_send_again")):
         try:
-            if queued:
-                await status.set(context.bot, i18n.t(lang, "downloading"))
-            path = await asyncio.to_thread(download_video, url, tempfile.gettempdir())
-            caption = None
-            if await asyncio.to_thread(get_caption_enabled, update.effective_user.id):
-                caption = i18n.t(lang, "download_credit_caption", username=BOT_USERNAME)
-
-            # Streamed from disk by python-telegram-bot rather than read into
-            # memory here first.
-            lossless = await asyncio.to_thread(get_lossless_enabled, update.effective_user.id)
-            with open(path, "rb") as f:
-                if lossless:
-                    # As a document Telegram passes the file through
-                    # untouched -- same container, same bitrate as yt-dlp
-                    # produced. As a video it re-encodes for streaming.
-                    #
-                    # disable_content_type_detection is what makes that
-                    # true, and leaving it off is why /lossless looked
-                    # broken for videos while working for images: the Bot
-                    # API sniffs an uploaded document by default, decides
-                    # an .mp4 is really a video, and delivers it as one --
-                    # re-encoded, which is the entire thing this branch
-                    # exists to avoid. It does not do that to a .jpg,
-                    # which is why the image paths were unaffected.
-                    await update.message.reply_document(
-                        f, filename=os.path.basename(path), caption=caption,
-                        reply_markup=_nudge_kb(), read_timeout=120, write_timeout=120,
-                        disable_content_type_detection=True,
-                    )
-                else:
-                    await update.message.reply_video(
-                        f, caption=caption, reply_markup=_nudge_kb(),
-                        read_timeout=120, write_timeout=120,
-                    )
-            await status.delete(context.bot)
-        except TooLarge as exc:
-            await status.set(context.bot, str(exc))
-            return
-        except BlockedBySource as exc:
-            # The site turned the *server* away. Nothing the user did is
-            # wrong and nothing they can do will help, so they get a
-            # sentence rather than yt-dlp's advice about exporting
-            # cookies from a browser they are not using.
-            #
-            # Two sentences, because the two refusals are not the same
-            # promise. A bot check may well pass on the next try. A login
-            # wall will not pass on any try: it wants a credential this bot
-            # does not have, and "try again in a bit" would be a lie.
-            logger.warning("Blocked by %s (%s): %s", exc.site, exc.kind, url)
-            key = ("source_needs_login" if exc.kind == "login_required"
-                   else "source_blocked_server")
+            resolved = await resolvers.resolve(platform, url)
+        except resolvers.NothingWorked as exc:
+            logger.info("no route worked for %s: %s", platform, exc)
+            if exc.kind == "missing" and quiet_if_missing:
+                return False
+            key = {
+                "missing": "download_missing",
+                "blocked": "download_blocked",
+                "too_big": "download_too_big",
+            }.get(exc.kind, "download_all_routes_failed")
+            # NO_PREVIEW: yt-dlp's failures quote their own documentation URLs
+            # and Telegram expands the first link in a message, so a one-line
+            # "couldn't download that" once arrived as a full-width GitHub
+            # repository, logo and all, underneath a failed download.
             await status.set(context.bot, i18n.t(lang, key), **NO_PREVIEW)
-            return
+            return False
+
+        try:
+            await status.set(context.bot, i18n.t(lang, "downloading"))
+            items = resolved.items
+            for item in items:
+                paths.append(await resolvers.download(item))
+            await _send_media(update, context, list(zip(items, paths)), lang)
+            await status.delete(context.bot)
+        except net.FetchError as exc:
+            await status.set(context.bot, str(exc), **NO_PREVIEW)
+            return False
         except Exception as exc:
-            logger.exception("Video download failed")
-            # NO_PREVIEW: an error from yt-dlp routinely carries a link to
-            # its own documentation, and Telegram expands the first URL in a
-            # message into a full-width preview card. The user was shown a
-            # GitHub repository, with a logo, under a failed download.
+            logger.exception("Delivering %s via %s failed", platform, resolved.provider)
             await status.set(context.bot, i18n.t(lang, "download_failed", error=exc),
                              **NO_PREVIEW)
-            return
+            return False
         finally:
-            if path and os.path.exists(path):
-                os.remove(path)
+            for path in paths:
+                try:
+                    if path and os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    logger.warning("couldn't remove %s", path)
 
     await _after_send(update, context, lang)
-
-
-async def _handle_pinterest(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    lang = await i18n.get_lang(update.effective_user.id, context)
-    status = await LiveMessage.reply_to(update.message, i18n.t(lang, "fetching"))
-    try:
-        image_bytes = await platforms.fetch_pinterest_image(url)
-    except Exception:
-        logger.exception("Pinterest image fetch failed")
-        image_bytes = None
-
-    if image_bytes:
-        await _reply_image(update, image_bytes, "pinterest", reply_markup=_nudge_kb())
-        await status.delete(context.bot)
-        await _after_send(update, context, lang)
-        return
-
-    # No og:image found -- most likely a video pin. Fall through to yt-dlp.
-    await _download_and_send_video(update, context, url, status=status)
+    return True
 
 
 async def _handle_reddit(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
+    """Reddit is the one platform where the *text* is often the point, so the
+    post is read first and only media posts go near the download path."""
     lang = await i18n.get_lang(update.effective_user.id, context)
     status = await LiveMessage.reply_to(update.message, i18n.t(lang, "fetching"))
     try:
@@ -690,14 +785,14 @@ async def _handle_reddit(update: Update, context: ContextTypes.DEFAULT_TYPE, url
         direct_img = platforms.reddit_direct_image_url(post)
         if direct_img:
             try:
-                image = await platforms.fetch_bytes(direct_img)
+                image = await net.fetch_bytes(direct_img)
                 await _reply_image(update, image, "reddit", reply_markup=_nudge_kb())
                 await status.delete(context.bot)
                 await _after_send(update, context, lang)
                 return
             except Exception:
-                logger.exception("Reddit direct image fetch failed -- falling back to yt-dlp")
-        await _download_and_send_video(update, context, url, status=status)
+                logger.exception("Reddit direct image fetch failed -- falling back")
+        await _resolve_and_send(update, context, "reddit", url, status=status)
         return
 
     # Text or link post -- render a card instead of just dumping the title.
@@ -706,7 +801,7 @@ async def _handle_reddit(update: Update, context: ContextTypes.DEFAULT_TYPE, url
     # draw missing-glyph boxes.
     title = post.get("title", "")
     selftext = post.get("selftext", "")
-    body = title if not selftext else f"{title}\n\n{selftext}"
+    body = title if not selftext else title + "\n\n" + selftext
     subreddit = "r/" + post.get("subreddit", "?")
     author = "u/" + post.get("author", "?")
     score = post.get("score")
@@ -723,45 +818,22 @@ async def _handle_reddit(update: Update, context: ContextTypes.DEFAULT_TYPE, url
 
 
 async def _handle_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
+    """Media first, card second.
+
+    Before v1.2.1 this asked X's syndication endpoint what the tweet
+    contained and then sent yt-dlp after the video, so a video tweet needed
+    both of them to be working at once. Now the provider chain answers the
+    media question on its own, and syndication is consulted only for the
+    tweets that have no media -- the one thing it is still needed for, and
+    the case it has always been most reliable at.
+    """
     lang = await i18n.get_lang(update.effective_user.id, context)
     status = await LiveMessage.reply_to(update.message, i18n.t(lang, "fetching"))
-    tweet = await platforms.fetch_tweet_syndication(url)
-
-    has_video = bool(tweet and tweet.get("video"))
-    photos = (tweet or {}).get("photos") or []
-
-    if tweet and has_video:
-        await _download_and_send_video(update, context, url, status=status)
+    if await _resolve_and_send(update, context, "twitter", url, status=status,
+                               quiet_if_missing=True):
         return
 
-    if tweet and photos:
-        try:
-            # Four photos is Telegram's own album limit for a media group;
-            # the old code fetched up to ten and held them all in memory to
-            # send at most that many anyway.
-            images = [await platforms.fetch_bytes(p["url"]) for p in photos[:4]]
-            if len(images) == 1:
-                await _reply_image(update, images[0], "twitter", reply_markup=_nudge_kb())
-            elif await asyncio.to_thread(get_lossless_enabled, update.effective_user.id):
-                await update.message.reply_media_group(
-                    [
-                        InputMediaDocument(
-                            BytesIO(b), filename=f"twitter_{n}.{_image_extension(b)}",
-                            disable_content_type_detection=True,
-                        )
-                        for n, b in enumerate(images, start=1)
-                    ]
-                )
-            else:
-                await update.message.reply_media_group(
-                    [InputMediaPhoto(BytesIO(b)) for b in images]
-                )
-            await status.delete(context.bot)
-            await _after_send(update, context, lang)
-            return
-        except Exception:
-            logger.exception("Twitter photo fetch failed -- falling back to a card")
-
+    tweet = await platforms.fetch_tweet_syndication(url)
     if tweet:
         # Card meta label ("likes") stays English -- see the Reddit card
         # comment above re: Pillow's built-in font having no Cyrillic glyphs.
@@ -771,14 +843,15 @@ async def _handle_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
         author = user.get("name", "")
         likes = tweet.get("favorite_count")
         meta = f"{likes:,} likes" if isinstance(likes, int) else ""
-        png = await asyncio.to_thread(cards.render_card, "twitter", source, author, tweet.get("text", ""), meta)
+        png = await asyncio.to_thread(
+            cards.render_card, "twitter", source, author, tweet.get("text", ""), meta)
         await _reply_image(update, png, "tweet", reply_markup=_nudge_kb())
         await status.delete(context.bot)
         await _after_send(update, context, lang)
         return
 
-    # X blocked/rate-limited the fetch entirely -- don't error, just hand
-    # back the link rather than pretend this failed outright.
+    # X blocked the fetch entirely -- don't error, just hand back the link
+    # rather than pretend this failed outright.
     await status.set(context.bot, i18n.t(lang, "twitter_fetch_failed_link", url=url))
 
 
@@ -788,28 +861,26 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     platform, url = detected
 
-    # Asked once, here, for every platform. The gate used to live inside
-    # _download_and_send_video only -- which covers Instagram, TikTok and
-    # YouTube, and misses the three paths that fetch an image and send it
-    # without ever reaching that function: a Pinterest pin, a Reddit image
-    # post and a Twitter photo set all sailed straight through an announced
-    # update. They are quicker than a video download, but "quick" is not the
-    # test: a redeploy lands whenever it lands, and a fetch that started
-    # ten seconds before it ends in silence exactly the same way.
+    # Asked once, here, for every platform. The gate used to live inside the
+    # video path only -- which covers Instagram, TikTok and YouTube, and
+    # misses the paths that fetch an image and send it without ever reaching
+    # that function: a Pinterest pin, a Reddit image post and a Twitter photo
+    # set all sailed straight through an announced update. They are quicker
+    # than a video download, but "quick" is not the test: a redeploy lands
+    # whenever it lands, and a fetch that started ten seconds before it ends
+    # in silence exactly the same way.
     lang = await i18n.get_lang(update.effective_user.id, context)
     refusal = await refuse_new_work(lang, update.effective_user.id, update.effective_chat.id)
     if refusal:
         await update.message.reply_text(refusal)
         return
 
-    if platform in ("instagram_tiktok", "youtube"):
-        await _download_and_send_video(update, context, url)
-    elif platform == "pinterest":
-        await _handle_pinterest(update, context, url)
-    elif platform == "reddit":
+    if platform == "reddit":
         await _handle_reddit(update, context, url)
     elif platform == "twitter":
         await _handle_twitter(update, context, url)
+    else:
+        await _resolve_and_send(update, context, platform, url)
 
 
 async def unrecognized_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -828,6 +899,20 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _post_init(application):
     await tune_runtime(application)
+    # Which download routes were working when this container's predecessor
+    # stopped. Without it a bot that redeploys several times a day re-learns
+    # that a dead service is dead every single time, at a user's expense.
+    try:
+        resolvers.load(await asyncio.to_thread(load_provider_health))
+    except Exception:
+        logger.warning("couldn't load provider health -- starting from scratch",
+                       exc_info=True)
+    if application.job_queue is not None:
+        application.job_queue.run_repeating(
+            _flush_provider_health,
+            interval=PROVIDER_HEALTH_FLUSH_SECONDS,
+            first=PROVIDER_HEALTH_FLUSH_SECONDS,
+        )
     # Before the first getUpdates: if the container this one replaces is
     # still polling, both get 409 Conflict and this bot's updates are split
     # between them. See lifecycle.py.
@@ -836,7 +921,10 @@ async def _post_init(application):
 
 
 async def _post_stop(application):
-    await platforms.close_client()
+    # Before the pool closes: this is the one write that would otherwise lose
+    # a whole flush interval of "this route just started failing".
+    await _flush_provider_health()
+    await net.close_client()
     # Before flush_on_shutdown, which closes the pool lifecycle writes through.
     await lifecycle.on_stop(application)
     await flush_on_shutdown(application)
@@ -874,6 +962,7 @@ def main():
     app.add_handler(CommandHandler("dbdump", dbdump_command))  # owner-only
     app.add_handler(CommandHandler("messageas", messageas_command))  # owner-only
     app.add_handler(CommandHandler("status", status_command))  # owner-only
+    app.add_handler(CommandHandler("providers", providers_command))  # owner-only
     app.add_handler(CallbackQueryHandler(caption_toggle_callback, pattern="^caption:"))
     app.add_handler(CallbackQueryHandler(lossless_toggle_callback, pattern="^lossless:"))
     app.add_handler(CallbackQueryHandler(cancel_choice_callback, pattern="^cancelpick:"))

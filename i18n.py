@@ -80,11 +80,11 @@ STRINGS = {
         ),
         "help_text": (
             "Paste a link any time and I'll grab it -- no command needed:\n"
-            "  - Instagram / TikTok: video\n"
-            "  - Pinterest: the pin's image (or video, if it's a video pin)\n"
-            "  - Reddit: the media if it's a media post, or a clean image card of "
-            "the post if it's text/a link\n"
-            "  - Twitter/X: same split as Reddit -- media, or a card for text tweets\n\n"
+            "  - Instagram: reels, photos, whole carousels\n"
+            "  - TikTok: videos without the watermark, and photo slideshows\n"
+            "  - Twitter/X: video and photos, or a clean image card for a text post\n"
+            "  - Pinterest: the pin, at full size\n"
+            "  - Reddit: the media if it's a media post, or a card if it's text\n\n"
             "Commands:\n"
             '/caption on|off - toggle the "via @{username}" credit caption\n'
             "/lossless on|off - get downloads as uncompressed files\n"
@@ -113,8 +113,10 @@ STRINGS = {
         "update_will_reset": "🔧 Heads up: I'm about to be updated, and what you have going right now will be reset. You'll be able to start it again in a few minutes.",
         "update_done_try_now": '✅ The update is done — go ahead and try again now.',
         "download_failed": "Couldn't download that: {error}",
-        "source_blocked_server": "🚫 YouTube is asking this server to prove it isn't a bot — something it does to servers, not to people. Nothing is wrong with your link. Try again in a while, or send it to me from a different site if you can.",
-        "source_needs_login": "🔒 That one is behind a login. Instagram stopped serving posts to servers that aren't signed in, so I can't reach it from here — your link is fine, and trying again won't change it. Public posts from other sites still work.",
+        "download_blocked": "🚫 I tried every way I have of getting that one and the site turned all of them away. That is about where the request came from, not about your link. Try again in a bit — this usually sorts itself out.",
+        "download_missing": "🔍 I couldn't find that post. Usually that means it was deleted, or it is from a private account. Public posts still work.",
+        "download_too_big": "📦 That one is bigger than Telegram lets me send. Try a shorter clip.",
+        "download_all_routes_failed": "😕 That one didn't work, and I tried every way I know. Give it a minute and send it again — if it keeps failing, it is the site, not the link.",
         "fetching": "Fetching...",
         "reddit_fetch_failed": "Couldn't fetch that Reddit post: {error}",
         "twitter_fetch_failed_link": "Couldn't fetch that post's content right now -- here's the link: {url}",
@@ -169,10 +171,11 @@ STRINGS = {
         ),
         "help_text": (
             "Istalgan vaqtda havola yuboring — men uni olib beraman, buyruq shart emas:\n"
-            "  - Instagram / TikTok: video\n"
-            "  - Pinterest: pin rasmi (agar video-pin bo'lsa — video)\n"
-            "  - Reddit: agar media post bo'lsa — media, matn/havola bo'lsa — toza rasm-karta\n"
-            "  - Twitter/X: Reddit bilan bir xil — media yoki matnli tvitlar uchun karta\n\n"
+            "  - Instagram: reels, rasmlar, butun karusel\n"
+            "  - TikTok: suv belgisiz video va rasm-slaydlar\n"
+            "  - Twitter/X: video va rasmlar, matnli post uchun esa toza rasm-karta\n"
+            "  - Pinterest: pin, to'liq o'lchamda\n"
+            "  - Reddit: media post bo'lsa — media, matn bo'lsa — karta\n\n"
             "Buyruqlar:\n"
             '/caption on|off - yuklamalardagi "via @{username}" yozuvini yoqish/o\'chirish\n'
             "/lossless on|off - yuklamalarni siqilmagan fayl sifatida olish\n"
@@ -201,8 +204,10 @@ STRINGS = {
         "update_will_reset": "🔧 Diqqat: men yangilanmoqchiman va hozir boshlagan ishingiz bekor qilinadi. Bir necha daqiqadan so'ng qaytadan boshlashingiz mumkin.",
         "update_done_try_now": "✅ Yangilanish tugadi — endi qaytadan urinib ko'rishingiz mumkin.",
         "download_failed": "Buni yuklab bo'lmadi: {error}",
-        "source_blocked_server": '🚫 YouTube bu serverdan “bot emasligini” tasdiqlashni so‘rayapti — buni odamlardan emas, serverlardan so‘raydi. Havolangizda xatolik yo‘q. Birozdan so‘ng qaytadan urinib ko‘ring.',
-        "source_needs_login": '🔒 Bu post tizimga kirishni talab qiladi. Instagram tizimga kirmagan serverlarga postlarni bermay qo‘ydi, shuning uchun bu yerdan unga yeta olmayman — havolangiz joyida, qayta urinish ham yordam bermaydi. Boshqa saytlardagi ochiq postlar ishlashda davom etadi.',
+        "download_blocked": '🚫 Buni olishning barcha yo‘llarini sinab ko‘rdim, sayt hammasini rad etdi. Bu havolangizga emas, so‘rov qayerdan kelganiga bog‘liq. Birozdan so‘ng qayta urinib ko‘ring — odatda o‘zi tuzalib ketadi.',
+        "download_missing": '🔍 Bu postni topa olmadim. Odatda bu post o‘chirilgan yoki yopiq akkauntdan ekanini bildiradi. Ochiq postlar ishlayveradi.',
+        "download_too_big": '📦 Bu fayl Telegram ruxsat beradigan hajmdan katta. Qisqaroq video sinab ko‘ring.',
+        "download_all_routes_failed": '😕 Bu ishlamadi, men bilgan barcha yo‘llarni sinab ko‘rdim. Bir daqiqadan so‘ng yana yuboring — agar takrorlansa, muammo havolada emas, saytda.',
         "fetching": "Olinmoqda...",
         "reddit_fetch_failed": "Bu Reddit postini olib bo'lmadi: {error}",
         "twitter_fetch_failed_link": "Hozircha bu post mazmunini olib bo'lmadi — mana havola: {url}",
@@ -256,11 +261,11 @@ STRINGS = {
         ),
         "help_text": (
             "Просто пришли ссылку в любое время — я её заберу, команда не нужна:\n"
-            "  - Instagram / TikTok: видео\n"
-            "  - Pinterest: изображение пина (или видео, если это видео-пин)\n"
-            "  - Reddit: медиа, если это медиа-пост, или аккуратная карточка-изображение, "
-            "если это текст/ссылка\n"
-            "  - Twitter/X: то же самое, что и Reddit — медиа или карточка для текстовых твитов\n\n"
+            "  - Instagram: reels, фото, карусели целиком\n"
+            "  - TikTok: видео без водяного знака и фото-слайдшоу\n"
+            "  - Twitter/X: видео и фото, а для текстового поста — аккуратная карточка\n"
+            "  - Pinterest: пин в полном размере\n"
+            "  - Reddit: медиа, если это медиа-пост, или карточка, если это текст\n\n"
             "Команды:\n"
             '/caption on|off - включить/выключить подпись "via @{username}" на загрузках\n'
             "/lossless on|off - получать загрузки несжатыми файлами\n"
@@ -289,8 +294,10 @@ STRINGS = {
         "update_will_reset": '🔧 Внимание: меня скоро обновят, и то, что вы сейчас начали, будет сброшено. Через несколько минут сможете начать заново.',
         "update_done_try_now": '✅ Обновление завершено — можете пробовать снова.',
         "download_failed": "Не удалось это скачать: {error}",
-        "source_blocked_server": '🚫 YouTube просит этот сервер подтвердить, что он не бот — такое он делает с серверами, а не с людьми. С вашей ссылкой всё в порядке. Попробуйте позже.',
-        "source_needs_login": '🔒 Этот пост доступен только после входа в аккаунт. Instagram перестал отдавать посты серверам без авторизации, поэтому отсюда я до него не доберусь — ссылка у вас правильная, и повторная попытка ничего не изменит. Публичные посты с других сайтов по-прежнему работают.',
+        "download_blocked": '🚫 Я перебрал все способы достать это, и сайт отказал всем. Дело не в ссылке, а в том, откуда пришёл запрос. Попробуйте через некоторое время — обычно это проходит само.',
+        "download_missing": '🔍 Не нашёл этот пост. Обычно это значит, что его удалили или он из закрытого аккаунта. Публичные посты работают.',
+        "download_too_big": '📦 Это больше, чем Telegram позволяет мне отправить. Попробуйте ролик покороче.',
+        "download_all_routes_failed": '😕 Не получилось, а я пробовал все способы. Подождите минуту и пришлите снова — если повторяется, дело в сайте, а не в ссылке.',
         "fetching": "Загрузка...",
         "reddit_fetch_failed": "Не удалось получить этот пост Reddit: {error}",
         "twitter_fetch_failed_link": "Не удалось получить содержимое поста прямо сейчас — вот ссылка: {url}",

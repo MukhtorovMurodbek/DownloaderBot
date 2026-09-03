@@ -1,4 +1,13 @@
-"""Download Instagram / TikTok videos with yt-dlp so the bot can re-send them.
+"""The yt-dlp provider: download a video with yt-dlp so the bot can re-send it.
+
+Since v1.2.1 this is one link in resolvers.py's chain rather than the whole
+download path, and it is deliberately *last* in every chain. yt-dlp makes the
+request from this container's own address, and a datacenter address is the
+thing Instagram and YouTube object to -- so it is the route most likely to
+come back with a login page, and the only route that gets better the moment
+DBOT_<SITE>_COOKIES_FILE or DBOT_<SITE>_PROXY is set. It is also the only
+route that works for YouTube at all, and the only one that muxes Reddit's
+separate DASH video and audio tracks.
 
 yt-dlp is imported lazily, inside download_video(). Importing it costs
 roughly 30-40 MB of resident memory and a second of startup for its
@@ -7,13 +16,7 @@ anyone pasting a link should not be paying that the whole time. The first
 download pays it once, and it stays loaded from then on.
 """
 import os
-import re
 import uuid
-
-LINK_RE = re.compile(
-    r"https?://(?:www\.|vm\.|vt\.)?(?:instagram\.com|tiktok\.com)/\S+",
-    re.IGNORECASE,
-)
 
 # Telegram itself refuses uploads over 50 MB without a local Bot API server,
 # so anything larger was always going to be downloaded and then thrown away.
@@ -57,6 +60,8 @@ SITE_COOKIEFILES = {
     "youtube": os.environ.get("DBOT_YT_COOKIES_FILE") or None,
     "instagram": os.environ.get("DBOT_IG_COOKIES_FILE") or None,
     "tiktok": os.environ.get("DBOT_TT_COOKIES_FILE") or None,
+    "twitter": os.environ.get("DBOT_TW_COOKIES_FILE") or None,
+    "reddit": os.environ.get("DBOT_RD_COOKIES_FILE") or None,
 }
 
 # Where the request goes out from. The reason cookies are not always enough:
@@ -69,6 +74,8 @@ SITE_PROXIES = {
     "youtube": os.environ.get("DBOT_YT_PROXY") or None,
     "instagram": os.environ.get("DBOT_IG_PROXY") or None,
     "tiktok": os.environ.get("DBOT_TT_PROXY") or None,
+    "twitter": os.environ.get("DBOT_TW_PROXY") or None,
+    "reddit": os.environ.get("DBOT_RD_PROXY") or None,
 }
 
 # What the "sign in to confirm you're not a bot" wall looks like coming back
@@ -95,12 +102,22 @@ LOGIN_WALL_MARKERS = (
 
 
 def _site_of(url: str) -> str:
+    """Which per-site cookie jar and proxy apply. The split matters: the
+    YouTube problem wants a Google account and the Instagram one wants an
+    Instagram account, and handing either site the other's cookies is worse
+    than handing it none."""
     lowered = url.lower()
-    for site in ("instagram", "tiktok", "youtube"):
+    for site in ("instagram", "tiktok", "youtube", "pinterest", "reddit"):
         if site in lowered:
             return site
     if "youtu.be" in lowered:
         return "youtube"
+    if "twitter.com" in lowered or "//x.com" in lowered:
+        return "twitter"
+    if "redd.it" in lowered:
+        return "reddit"
+    if "pin.it" in lowered:
+        return "pinterest"
     return "other"
 
 
@@ -121,11 +138,6 @@ class BlockedBySource(Exception):
 
 class TooLarge(Exception):
     """The clip is over the size/duration ceiling. Message is user-facing."""
-
-
-def find_link(text: str) -> str | None:
-    match = LINK_RE.search(text)
-    return match.group(0) if match else None
 
 
 def _reject_long(info, *, incomplete):

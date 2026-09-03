@@ -53,9 +53,16 @@ except ImportError:
     pass
 
 from telegram import (
-    BotCommand, InputMediaDocument, InputMediaPhoto, Update,
+    BotCommand, InputMediaDocument, InputMediaPhoto, LinkPreviewOptions, Update,
     InlineKeyboardButton, InlineKeyboardMarkup,
 )
+
+# For any message whose text is an error. yt-dlp's failures quote their own
+# documentation URLs, and Telegram turns the first link in a message into a
+# preview card -- so a one-line "couldn't download that" arrived as a
+# full-width GitHub repository with a logo, which looks far more like the bot
+# breaking than like the site saying no.
+NO_PREVIEW = {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -620,17 +627,29 @@ async def _download_and_send_video(update: Update, context: ContextTypes.DEFAULT
         except TooLarge as exc:
             await status.set(context.bot, str(exc))
             return
-        except BlockedBySource:
+        except BlockedBySource as exc:
             # The site turned the *server* away. Nothing the user did is
             # wrong and nothing they can do will help, so they get a
             # sentence rather than yt-dlp's advice about exporting
             # cookies from a browser they are not using.
-            logger.warning("Blocked by the source site: %s", url)
-            await status.set(context.bot, i18n.t(lang, "source_blocked_server"))
+            #
+            # Two sentences, because the two refusals are not the same
+            # promise. A bot check may well pass on the next try. A login
+            # wall will not pass on any try: it wants a credential this bot
+            # does not have, and "try again in a bit" would be a lie.
+            logger.warning("Blocked by %s (%s): %s", exc.site, exc.kind, url)
+            key = ("source_needs_login" if exc.kind == "login_required"
+                   else "source_blocked_server")
+            await status.set(context.bot, i18n.t(lang, key), **NO_PREVIEW)
             return
         except Exception as exc:
             logger.exception("Video download failed")
-            await status.set(context.bot, i18n.t(lang, "download_failed", error=exc))
+            # NO_PREVIEW: an error from yt-dlp routinely carries a link to
+            # its own documentation, and Telegram expands the first URL in a
+            # message into a full-width preview card. The user was shown a
+            # GitHub repository, with a logo, under a failed download.
+            await status.set(context.bot, i18n.t(lang, "download_failed", error=exc),
+                             **NO_PREVIEW)
             return
         finally:
             if path and os.path.exists(path):

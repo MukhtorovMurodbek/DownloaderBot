@@ -44,10 +44,32 @@ YT_PLAYER_CLIENTS = [
 ]
 
 # A cookies.txt exported from a logged-in browser is the reliable answer, and
-# it is deliberately not the default: it ties this bot to a real Google
-# account, the cookies expire in days, and the account can be banned for it.
-# If you use one, use a throwaway account -- never your own.
-YT_COOKIEFILE = os.environ.get("DBOT_COOKIES_FILE") or None
+# it is deliberately not the default: it ties this bot to a real account, the
+# cookies expire in days, and the account can be banned for it. If you use
+# one, use a throwaway account -- never your own.
+#
+# DBOT_COOKIES_FILE applies to every site. The per-site ones win where they
+# are set, because the two problems want different accounts: a Google account
+# for YouTube and an Instagram one for Instagram, and handing either site the
+# other's cookie jar is worse than handing it none.
+COOKIEFILE = os.environ.get("DBOT_COOKIES_FILE") or None
+SITE_COOKIEFILES = {
+    "youtube": os.environ.get("DBOT_YT_COOKIES_FILE") or None,
+    "instagram": os.environ.get("DBOT_IG_COOKIES_FILE") or None,
+    "tiktok": os.environ.get("DBOT_TT_COOKIES_FILE") or None,
+}
+
+# Where the request goes out from. The reason cookies are not always enough:
+# these sites rate-limit by IP as well as by session, every cloud host's
+# address is a known datacenter range, and a datacenter IP is most of why the
+# server is challenged when a phone on the same link is not. A residential or
+# mobile proxy is the robust answer and the only one that does not expire.
+PROXY = os.environ.get("DBOT_PROXY") or None
+SITE_PROXIES = {
+    "youtube": os.environ.get("DBOT_YT_PROXY") or None,
+    "instagram": os.environ.get("DBOT_IG_PROXY") or None,
+    "tiktok": os.environ.get("DBOT_TT_PROXY") or None,
+}
 
 # What the "sign in to confirm you're not a bot" wall looks like coming back
 # out of yt-dlp. Matched so the user gets a sentence instead of a stack of
@@ -55,9 +77,46 @@ YT_COOKIEFILE = os.environ.get("DBOT_COOKIES_FILE") or None
 BOT_CHECK_MARKERS = ("sign in to confirm", "confirm you're not a bot",
                      "confirm you are not a bot")
 
+# And what a login wall looks like. Instagram stopped serving reels to
+# anonymous callers from datacenter addresses, so this is now the *ordinary*
+# outcome there rather than an edge case -- and until it was matched here the
+# user got yt-dlp's raw text, complete with a link to its FAQ that Telegram
+# then expanded into a full-width GitHub preview card. That reads as the bot
+# having crashed and helpfully shown you its documentation.
+LOGIN_WALL_MARKERS = (
+    "redirected to the login page",
+    "rate-limit for accessing posts anonymously",
+    "requested content is not available, rate-limit reached",
+    "login required",
+    "you need to log in",
+    "use --cookies",
+    "--cookies-from-browser",
+)
+
+
+def _site_of(url: str) -> str:
+    lowered = url.lower()
+    for site in ("instagram", "tiktok", "youtube"):
+        if site in lowered:
+            return site
+    if "youtu.be" in lowered:
+        return "youtube"
+    return "other"
+
 
 class BlockedBySource(Exception):
-    """The site refused the server, not the link. Message is user-facing."""
+    """The site refused the server, not the link.
+
+    `kind` says which way it refused, because the two want different
+    sentences: "bot_check" is a challenge that may pass on a retry, and
+    "login_required" will not pass on any retry -- it needs a credential this
+    bot does not have, and saying "try again later" about it is a lie.
+    """
+
+    def __init__(self, message: str, kind: str = "bot_check", site: str = "other"):
+        super().__init__(message)
+        self.kind = kind
+        self.site = site
 
 
 class TooLarge(Exception):
@@ -145,8 +204,13 @@ def download_video(url: str, out_dir: str) -> str:
         "merge_output_format": "mp4",
         "extractor_args": {"youtube": {"player_client": YT_PLAYER_CLIENTS}},
     }
-    if YT_COOKIEFILE and os.path.exists(YT_COOKIEFILE):
-        ydl_opts["cookiefile"] = YT_COOKIEFILE
+    site = _site_of(url)
+    cookiefile = SITE_COOKIEFILES.get(site) or COOKIEFILE
+    if cookiefile and os.path.exists(cookiefile):
+        ydl_opts["cookiefile"] = cookiefile
+    proxy = SITE_PROXIES.get(site) or PROXY
+    if proxy:
+        ydl_opts["proxy"] = proxy
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=True)
@@ -156,7 +220,9 @@ def download_video(url: str, out_dir: str) -> str:
                 # Nothing the user did is wrong and nothing they can do
                 # will help, so the answer says so plainly rather than
                 # handing them yt-dlp's advice about exporting cookies.
-                raise BlockedBySource(str(exc)) from exc
+                raise BlockedBySource(str(exc), "bot_check", site) from exc
+            if any(marker in lowered for marker in LOGIN_WALL_MARKERS):
+                raise BlockedBySource(str(exc), "login_required", site) from exc
             raise
         if info is None:
             # match_filter rejected it -- the reason is already in the log,

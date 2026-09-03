@@ -668,6 +668,144 @@ async def resolve(platform: str, url: str) -> Resolved:
 
 
 # ---------------------------------------------------------------------------
+# Asking every route, on purpose
+# ---------------------------------------------------------------------------
+# resolve() stops at the first route that works, which is what a user wants
+# and exactly the wrong thing for finding out what is going on. This asks all
+# of them and reports each answer.
+#
+# It deliberately does not touch the health scores. A probe is a question, not
+# traffic, and letting an operator's curiosity reorder the chain -- or worse,
+# rest a route that a real user could have used -- would make the scores mean
+# something other than "what happens to users".
+
+# Public posts, each one confirmed to resolve when this was written. If a row
+# comes back "missing" for EVERY route at once, suspect the sample rather than
+# the internet: a real outage looks like one route failing, not all of them
+# agreeing.
+SAMPLES = {
+    "instagram": "https://www.instagram.com/reel/DTxk5orCKEv/",
+    "tiktok": "https://www.tiktok.com/@scout2015/video/6718335390845095173",
+    "twitter": "https://x.com/SpaceX/status/2042988940756480302",
+    "pinterest": "https://www.pinterest.com/pin/27725353928390009/",
+}
+
+PROBE_FETCH_BYTES = 64 * 1024
+
+
+async def probe_route(name, fn, url: str, fetch: bool = False,
+                      timeout: float | None = None) -> dict:
+    """One route, one link. Never raises."""
+    timeout = PROVIDER_TIMEOUT_S if timeout is None else timeout
+    started = time.perf_counter()
+    row = {"provider": name, "url": url, "ok": False, "detail": "", "items": 0,
+           "seconds": 0.0, "fetched": None}
+    try:
+        resolved = await asyncio.wait_for(fn(url), timeout=timeout)
+    except ProviderFailed as exc:
+        row["detail"] = f"{exc.kind}: {exc}"
+    except asyncio.TimeoutError:
+        row["detail"] = f"timed out after {timeout:.0f}s"
+    except Exception as exc:
+        row["detail"] = f"{type(exc).__name__}: {exc}"
+    else:
+        row["ok"] = True
+        row["items"] = len(resolved.items)
+        kinds = ", ".join(sorted({i.kind for i in resolved.items}))
+        row["detail"] = f"{len(resolved.items)} item(s) [{kinds}]"
+        if fetch and resolved.items:
+            row["fetched"] = await _probe_fetch(resolved.items[0])
+    row["seconds"] = round(time.perf_counter() - started, 1)
+    return row
+
+
+async def _probe_fetch(item: MediaItem) -> str:
+    """Prove the media URL actually serves, without pulling the whole file.
+
+    A GET abandoned after the first chunk, never a HEAD -- see net.py for the
+    TikTok CDN's 503-on-HEAD. yt-dlp's items are already on disk, so they are
+    measured and deleted instead.
+    """
+    if item.path:
+        try:
+            size = os.path.getsize(item.path)
+            os.remove(item.path)
+            return f"{size:,} bytes on disk"
+        except OSError as exc:
+            return f"file gone: {exc}"
+    for route in [u for u in [item.url, *item.alt_urls] if u]:
+        try:
+            async with net.client().stream("GET", route) as resp:
+                resp.raise_for_status()
+                got = 0
+                async for chunk in resp.aiter_bytes():
+                    got += len(chunk)
+                    if got >= PROBE_FETCH_BYTES:
+                        break
+                return f"{got:,} bytes, {resp.headers.get('content-type', '?')}"
+        except Exception as exc:
+            last = f"{type(exc).__name__}: {exc}"
+    return f"fetch failed: {last}"
+
+
+async def probe_all(urls: dict[str, str] | None = None, fetch: bool = False,
+                    timeout: float | None = None) -> dict:
+    """Every route for every platform in `urls` (default: SAMPLES).
+
+    Platforms run concurrently and the routes within one run in order, so the
+    whole thing costs about as long as the slowest single chain rather than
+    the sum of all of them. That matters because this is reachable over the
+    family bus, where ParentBot gives a command 90 seconds before calling it
+    a timeout -- and a probe that cannot finish inside that window is a probe
+    nobody can run from their phone.
+    """
+    urls = urls or SAMPLES
+
+    async def one(platform: str, url: str) -> tuple[str, list[dict]]:
+        rows = []
+        for name, fn in PROVIDERS.get(platform, []):
+            rows.append(await probe_route(name, fn, url, fetch=fetch, timeout=timeout))
+        return platform, rows
+
+    done = await asyncio.gather(*(one(p, u) for p, u in urls.items()))
+    return {platform: rows for platform, rows in done}
+
+
+# yt-dlp's errors are a paragraph each and every one of them quotes its own
+# issue tracker. Telegram expands the first URL in a message into a full-width
+# preview card, which is how a failed download once arrived as a GitHub
+# repository with a logo (v1.1.3). A probe report can carry a dozen of those,
+# so the URLs come out and the rest is trimmed to a line.
+_URL_RE = re.compile(r"https?://\S+")
+_NOISE_RE = re.compile(
+    r"\s*;?\s*please report this issue on.*|\s*Confirm you are on the latest version.*",
+    re.IGNORECASE | re.DOTALL)
+
+
+def tidy_error(text: str, limit: int = 150) -> str:
+    text = _NOISE_RE.sub("", text or "")
+    text = _URL_RE.sub("<link>", text)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def format_probe(results: dict) -> str:
+    """The report, as plain text -- it goes to a Telegram message and to a
+    terminal, and both want the same thing."""
+    lines = []
+    for platform, rows in results.items():
+        lines.append(f"\n{platform}:")
+        for row in rows:
+            mark = "OK  " if row["ok"] else "FAIL"
+            line = (f"  {mark} {row['provider']:<18} {row['seconds']:>4.1f}s  "
+                    f"{tidy_error(row['detail'])}")
+            if row["fetched"]:
+                line += f"  [{row['fetched']}]"
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
 # Getting the bytes
 # ---------------------------------------------------------------------------
 

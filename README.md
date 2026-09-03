@@ -36,9 +36,15 @@ and a single success puts it straight back at the front. Nothing needs a
 human to notice a service has died.
 
 - `/providers` (owner-only) — what the live bot has learned from real traffic.
-- `python probe.py` — asks every route on demand, from wherever you run it.
-  Note that the answer depends on the network you run it from, which is the
-  whole point.
+- **`/run downloaderbot probe`** (through ParentBot) — asks every route *from
+  inside the deployed container*. This is the one that settles arguments:
+  every route was verified on a laptop, and a laptop is on a residential
+  address, which is the exact thing these sites treat differently. Add
+  platform names (`probe instagram tiktok`) or paste real links to narrow it.
+- `python probe.py` — the same checks from a terminal, wherever you run it.
+
+Both probes ask every route rather than stopping at the first that works, and
+neither touches the health scores: a probe is a question, not traffic.
 
 Read `resolvers.py`'s docstring before changing any of it. `platforms.py` is
 now just link recognition plus the two page reads that feed the cards, and

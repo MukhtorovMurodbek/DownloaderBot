@@ -19,7 +19,9 @@ WHY THIS EXISTS
       and you learn what a residential address gets; the container is on a
       datacenter range and can be told something different by the same
       service. That gap is the reason the chain exists, so a green row here
-      is encouraging rather than conclusive.
+      is encouraging rather than conclusive. To ask from where it actually
+      matters, use the family bus: `/run downloaderbot probe` runs these same
+      checks inside the deployed container.
     - It deliberately does NOT touch the database, so it cannot be run
       against a bot that is live without also skewing its scores. The counts
       it prints are from this run only.
@@ -35,7 +37,6 @@ import argparse
 import asyncio
 import os
 import sys
-import time
 
 try:
     from dotenv import load_dotenv
@@ -47,13 +48,9 @@ import net
 import platforms
 import resolvers
 
-# Public posts, each one confirmed to resolve when this file was written.
-SAMPLES = [
-    "https://www.instagram.com/reel/DTxk5orCKEv/",
-    "https://www.tiktok.com/@scout2015/video/6718335390845095173",
-    "https://x.com/SpaceX/status/2042988940756480302",
-    "https://www.pinterest.com/pin/27725353928390009/",
-]
+# The sample links live in resolvers.py, so this CLI and the `probe` family-bus
+# command ask exactly the same questions of exactly the same posts.
+SAMPLES = list(resolvers.SAMPLES.values())
 
 GREEN, RED, YELLOW, DIM, OFF = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 if os.name == "nt" and not os.environ.get("WT_SESSION"):
@@ -69,65 +66,12 @@ async def probe_one(url: str, fetch: bool) -> None:
     print(f"\n{platform}  {DIM}{matched}{OFF}")
 
     for name, fn in resolvers.PROVIDERS.get(platform, []):
-        started = time.perf_counter()
-        try:
-            resolved = await asyncio.wait_for(
-                fn(matched), timeout=resolvers.PROVIDER_TIMEOUT_S)
-        except resolvers.ProviderFailed as exc:
-            print(f"  {RED}x{OFF} {name:<18} {exc.kind}: {exc}")
-            continue
-        except asyncio.TimeoutError:
-            print(f"  {RED}x{OFF} {name:<18} timed out")
-            continue
-        except Exception as exc:
-            print(f"  {RED}x{OFF} {name:<18} {type(exc).__name__}: {exc}")
-            continue
-
-        took = time.perf_counter() - started
-        kinds = ", ".join(sorted({i.kind for i in resolved.items}))
-        print(f"  {GREEN}v{OFF} {name:<18} {len(resolved.items)} item(s) "
-              f"[{kinds}] in {took:.1f}s")
-        for item in resolved.items:
-            target = item.path or item.url or ""
-            print(f"      {DIM}{item.kind}: {target[:96]}{OFF}")
-
-        if fetch and resolved.items:
-            item = resolved.items[0]
-            if item.path:
-                size = os.path.getsize(item.path)
-                print(f"      {GREEN}fetched{OFF} {size:,} bytes (yt-dlp wrote it)")
-                os.remove(item.path)
-                continue
-            try:
-                got, ctype = await _head_bytes(item)
-                mark = GREEN if got else YELLOW
-                print(f"      {mark}fetched{OFF} {got:,} bytes, {ctype}")
-            except Exception as exc:
-                print(f"      {RED}fetch failed{OFF}: {type(exc).__name__}: {exc}")
-
-
-async def _head_bytes(item, cap: int = 256 * 1024) -> tuple[int, str]:
-    """Pull the first chunk of a media URL.
-
-    A GET that is abandoned early, never a HEAD: TikTok's CDN answers HEAD
-    with a 503 while serving the identical GET perfectly, and net.py has the
-    same note for the same reason.
-    """
-    routes = [u for u in [item.url, *item.alt_urls] if u]
-    last = None
-    for route in routes:
-        try:
-            async with net.client().stream("GET", route) as resp:
-                resp.raise_for_status()
-                got = 0
-                async for chunk in resp.aiter_bytes():
-                    got += len(chunk)
-                    if got >= cap:
-                        break
-                return got, resp.headers.get("content-type", "?")
-        except Exception as exc:
-            last = exc
-    raise last or RuntimeError("no route")
+        row = await resolvers.probe_route(name, fn, matched, fetch=fetch)
+        mark = f"{GREEN}v{OFF}" if row["ok"] else f"{RED}x{OFF}"
+        line = f"  {mark} {name:<18} {row['seconds']:>4.1f}s  {row['detail']}"
+        if row["fetched"]:
+            line += f"  {DIM}[{row['fetched']}]{OFF}"
+        print(line)
 
 
 async def main() -> int:

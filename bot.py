@@ -532,6 +532,52 @@ async def _flush_provider_health(_context=None) -> None:
         logger.warning("couldn't save provider health", exc_info=True)
 
 
+# How long one route gets during a bus probe. Shorter than a real download's
+# PROVIDER_TIMEOUT, because ParentBot calls a family command failed after 90
+# seconds and a probe nobody can run from their phone is not worth having.
+PROBE_TIMEOUT_S = float(os.environ.get("DBOT_PROBE_TIMEOUT", "12"))
+
+
+async def _bus_probe(context, args):
+    """`probe [url|platform ...]` over the family bus.
+
+    THE POINT OF THIS COMMAND. Every route in resolvers.py was verified from
+    the developer's laptop, on a residential connection -- and the entire
+    reason those routes exist is that a residential address and a datacenter
+    address get different answers from the same site. So a laptop test proves
+    the code and proves nothing about production. This runs the same checks
+    from inside the container that actually serves users, which is the only
+    place the answer means anything.
+
+    It asks EVERY route rather than stopping at the first that works, and it
+    deliberately leaves the health scores alone: a probe is a question, not
+    traffic, and an operator's curiosity should not reorder the chain real
+    users get.
+
+    Defaults to the sample links in resolvers.SAMPLES. Name platforms
+    ("probe instagram tiktok") to narrow it, or paste real links to probe
+    those instead -- one per platform, since the later one wins.
+    """
+    fetch = True
+    urls: dict[str, str] = {}
+    for arg in args:
+        if arg in ("--nofetch", "nofetch"):
+            fetch = False
+            continue
+        if arg in resolvers.SAMPLES:
+            urls[arg] = resolvers.SAMPLES[arg]
+            continue
+        detected = platforms.detect_platform(arg)
+        if detected:
+            urls[detected[0]] = detected[1]
+    results = await resolvers.probe_all(urls or None, fetch=fetch,
+                                        timeout=PROBE_TIMEOUT_S)
+    header = ("Download routes, asked from inside this container "
+              f"({os.environ.get('RAILWAY_ENVIRONMENT') or 'local'}). "
+              "Scores untouched.\n")
+    return header + resolvers.format_probe(results), None, None
+
+
 async def providers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/providers -- which download route is working and which is not.
 
@@ -555,9 +601,11 @@ async def providers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif h.cooling_until > now:
                 mark = "\u274c"
                 note = (f"{h.streak} in a row, resting "
-                        f"{_ago(h.cooling_until - now)}: {h.last_error}")
+                        f"{_ago(h.cooling_until - now)}: "
+                        f"{resolvers.tidy_error(h.last_error)}")
             else:
-                mark, note = "\u26a0\ufe0f", f"{h.streak} in a row: {h.last_error}"
+                mark = "\u26a0\ufe0f"
+                note = f"{h.streak} in a row: {resolvers.tidy_error(h.last_error)}"
             lines.append(f"  {mark} {name} -- {h.ok} ok / {h.failed} failed, {note}")
     await update.message.reply_text(
         "Download routes, best first per platform:" + "\n".join(lines),
@@ -991,6 +1039,13 @@ def main():
     # uses to run this bot's owner-only commands remotely. Never raises --
     # with no shared database reachable the bot just runs on its own.
     family_link.attach(app, BOT_NAME, "DownloaderBot", START_TIME)
+    # One extra bus command, registered here rather than in family_link.py:
+    # only this bot has download routes to probe, and family_link.py has to
+    # stay byte-identical across all five. The dispatcher looks COMMANDS up
+    # per command, so adding to it after import is enough.
+    family_link.COMMANDS["probe"] = _bus_probe
+    family_link.COMMAND_HELP["probe"] = (
+        "probe [platform|url ...] -- try every download route from in here")
     attach_maintenance(app)
 
     logger.info("Bot starting (polling)...")

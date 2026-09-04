@@ -19,6 +19,8 @@ family_link.py. Things that live here:
      long-running process cheap -- writing buffered activity counts out in
      batches instead of a row per update, and dropping the cached per-user
      state of people who stopped using the bot months ago.
+  6. attach_flood_gate(): a ceiling on what one person can make the bot do
+     per minute, applied before any handler runs.
 """
 import asyncio
 import gc
@@ -29,17 +31,17 @@ import sys
 import time
 import traceback
 import uuid
-from collections import deque, namedtuple
+from collections import OrderedDict, deque, namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
 from telegram import (
     ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
-    ReplyKeyboardRemove,
+    ReplyKeyboardRemove, Update,
 )
 from telegram.error import BadRequest, NetworkError, RetryAfter
-from telegram.ext import ApplicationHandlerStop
+from telegram.ext import ApplicationHandlerStop, TypeHandler
 
 import db
 import i18n
@@ -159,27 +161,185 @@ async def tune_runtime(application) -> None:
     gc.set_threshold(GC_THRESHOLD, 20, 20)
 
 
+
+# ---------------------------------------------------------------------------
+# What one person is allowed to cost
+# ---------------------------------------------------------------------------
+# Telegram rate-limits what a bot SENDS and nothing at all about what it
+# receives, so until now one script could hold a container and a shared
+# database busy for as long as it liked: /stats in a loop is a query each, a
+# link pasted into DownloaderBot is a fetch and an encode, and an inbox link
+# is meant to be posted somewhere public, which is where the traffic that
+# does this comes from.
+#
+# The ceiling is per user and deliberately high -- a fast typist, an album,
+# and a run of button taps all have to pass -- because what it is defending
+# against is a loop, not a hurry.
+#
+# Two properties matter as much as the number:
+#
+#   It runs BEFORE any handler, so a refused update costs one dictionary
+#   lookup rather than a database round trip. A limit checked inside the
+#   handler has already paid for the thing it was meant to prevent.
+#
+#   It answers once and then goes quiet. A gate that replies to every
+#   refused message turns an incoming flood into an outgoing one, which is
+#   worse: the sender pays nothing and the bot pays Telegram's send budget
+#   for every other user in the queue.
+#
+# In memory rather than in the database on purpose, for the same reason
+# AnonBot's own limiter is: one container holds the polling lease, so there
+# is exactly one counter, and paying a round trip to enforce a per-minute
+# limit would cost more than the limit saves. A redeploy forgets it, and the
+# worst that costs is one burst getting through after a restart.
+
+FLOOD_UPDATES_PER_MINUTE = int(os.environ.get("FLOOD_UPDATES_PER_MINUTE", "40"))
+FLOOD_REMIND_SECONDS = int(os.environ.get("FLOOD_REMIND_SECONDS", "60"))
+_FLOOD_MAX_TRACKED = 4096
+
+_flood_window: "OrderedDict[int, deque]" = OrderedDict()
+_flood_told: "OrderedDict[int, float]" = OrderedDict()
+
+
+def _flood_trim(store) -> None:
+    while len(store) > _FLOOD_MAX_TRACKED:
+        store.popitem(last=False)
+
+
+def flood_wait_seconds(user_id: int) -> int:
+    """0 if this person may be served now, otherwise the whole seconds until
+    their oldest counted update falls out of the window."""
+    if FLOOD_UPDATES_PER_MINUTE <= 0:
+        return 0
+    now = time.monotonic()
+    window = _flood_window.setdefault(user_id, deque())
+    _flood_window.move_to_end(user_id)
+    _flood_trim(_flood_window)
+    while window and now - window[0] > 60:
+        window.popleft()
+    if len(window) >= FLOOD_UPDATES_PER_MINUTE:
+        return max(1, int(60 - (now - window[0])) + 1)
+    window.append(now)
+    return 0
+
+
+def _flood_should_tell(user_id: int) -> bool:
+    now = time.monotonic()
+    last = _flood_told.get(user_id)
+    if last is not None and now - last < FLOOD_REMIND_SECONDS:
+        return False
+    _flood_told[user_id] = now
+    _flood_told.move_to_end(user_id)
+    _flood_trim(_flood_told)
+    return True
+
+
+def attach_flood_gate(app, admin_ids=(), group: int = -3) -> None:
+    """Register in a group of its OWN, above every other group.
+
+    Its own group because python-telegram-bot runs one handler per group and
+    this one matches every update; above the others because a limit that
+    runs after the work has not limited anything. The owner is exempt --
+    /messageas and a sweep through /status are the bot's own operator using
+    it, and being throttled out of your own bot during an incident is the
+    wrong failure.
+    """
+    admins = set(admin_ids)
+
+    async def _gate(update, context) -> None:
+        user = update.effective_user
+        if user is None or user.id in admins:
+            return
+        wait = flood_wait_seconds(user.id)
+        if not wait:
+            return
+        if _flood_should_tell(user.id):
+            try:
+                lang = await i18n.get_lang(user.id, context)
+                if update.callback_query is not None:
+                    await update.callback_query.answer(
+                        i18n.t(lang, "flood_wait", seconds=wait), show_alert=True)
+                elif update.effective_message is not None:
+                    await update.effective_message.reply_text(
+                        i18n.t(lang, "flood_wait", seconds=wait))
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "Could not tell a flooding user to wait", exc_info=True)
+        raise ApplicationHandlerStop
+
+    app.add_handler(TypeHandler(Update, _gate), group=group)
+
 # ---------------------------------------------------------------------------
 # Donation reminder + /donate (Telegram Stars)
 # ---------------------------------------------------------------------------
-# Cadence: shown after DONATION_ACTION_THRESHOLD successful actions (each
-# bot decides what counts as an "action" -- a finished pack, a completed
-# conversion, etc -- and calls maybe_donation_nudge() at that point) OR
-# after DONATION_MIN_DAYS_BETWEEN days of not having seen it (so light users
-# get reminded occasionally too) -- but never twice within
-# DONATION_COOLDOWN_FLOOR_DAYS regardless, so someone who blitzes through 20
-# actions in one sitting only sees it once. The counter/cooldown live in
-# THIS bot's own schema only -- the five bots share one database but never
-# each other's tables, so a user active in two bots in the same week may see
-# the nudge from each of them; that's an accepted tradeoff. All three
-# numbers are just constants -- tune freely, same as the Stars price tiers
-# elsewhere.
+# Cadence: usage only, on a schedule that runs out.
+#
+# Each bot decides what counts as an "action" -- a finished pack, a completed
+# conversion, a delivered download -- and calls maybe_donation_nudge() at
+# that point. DONATION_STEPS is how many further actions are needed before
+# each successive nudge: the first at 15, the second 60 after that, the third
+# 200 after that, and then never again.
+#
+# What this replaced, and why (v1.2.3):
+#
+#   The old rule was "20 actions OR 14 days since the last nudge", floored at
+#   3 days. The time half was the problem. It fired on people who were barely
+#   using the bot -- the ones least likely to pay for it and most likely to
+#   read a fortnightly reminder as spam -- and it never stopped, so a user of
+#   three years who had already decided not to donate would be asked around
+#   seventy times. An ask that repeats forever is not an ask, it is a tax on
+#   being a regular.
+#
+#   Usage-only fixes the first half: the nudge now only ever arrives right
+#   after the bot has just done something useful, which is the one moment it
+#   has earned the right to ask. The schedule fixes the second: someone who
+#   has been asked three times across 275 successful actions and has not
+#   given has answered the question, and continuing to ask only costs
+#   goodwill.
+#
+# The counters live in THIS bot's own schema -- the five bots share one
+# database but never each other's tables -- so somebody active in two bots
+# may be asked by each. That is an accepted tradeoff and it is bounded now,
+# because each bot asks at most three times ever.
+#
+# Anyone with a paid row in star_transactions is never nudged again by that
+# bot. Thanking somebody for donating by asking them to donate is the worst
+# sentence this file could produce.
 
-DONATION_ACTION_THRESHOLD = 20
-DONATION_MIN_DAYS_BETWEEN = 14
+DONATION_STEPS = [15, 60, 200]
 DONATION_COOLDOWN_FLOOR_DAYS = 3
 
-DONATE_STAR_OPTIONS = [15, 50, 100]  # preset amounts shown as buttons on /donate
+# ---- pinning the nudge instead of repeating it (off by default) ----
+# The owner proposed pinning the prompt in the chat so it stays visible
+# without being re-sent. The instinct is right -- "ask once, remain visible"
+# beats "ask again" -- and the implementation is here, but it is off, for
+# three reasons worth reading before turning it on:
+#
+#   A pin is a permanent claim on the top of the user's chat window, for
+#   something explicitly voluntary. The nudge's own text ends "no pressure
+#   either way", and a pinned ask contradicts it.
+#
+#   Pinning posts a service message into the chat ("… pinned a message"),
+#   so the thing meant to avoid a second notification creates one. Pinning
+#   silently avoids the alert but not the service message.
+#
+#   It competes with the bot's real uses of the chat header. Nothing pins
+#   today, but the first genuinely useful thing to pin -- a maintenance
+#   notice, a sticker pack link -- would be arguing with a tip jar.
+#
+# With the schedule above capping the ask at three times ever, the problem
+# pinning was meant to solve is mostly already solved. If you want it anyway:
+# DONATION_PIN=on. It pins the nudge silently, unpins the previous one first,
+# and unpins for good the moment that person donates.
+
+DONATION_PIN = os.environ.get("DONATION_PIN", "off").lower() in ("on", "1", "true", "yes")
+
+# Preset amounts shown as buttons on /donate. Four tiers: a tap that costs
+# almost nothing and exists so that saying thank you is possible, two in the
+# middle, and a high anchor -- which is there as much to make the middle
+# look reasonable as to be chosen. Roughly $0.30 / $1 / $3 / $10 at what a
+# user pays for Stars.
+DONATE_STAR_OPTIONS = [15, 50, 150, 500]
 # Loose sanity ceiling for /donate <amount> -- not Telegram's real per-invoice
 # cap (which Telegram enforces itself; a rejected amount just surfaces
 # Telegram's own error text back to the sender), just a guard against an
@@ -206,12 +366,46 @@ MAX_DONATION_STARS = 100_000
 FIAT_CURRENCIES = {
     "USD": {
         "symbol": "$", "label": "USD", "exp": 2,
-        "options": [1, 5, 10], "min_minor": 100, "max_minor": 1_000_000,
+        # Deliberately not a straight conversion of the Stars column. The
+        # Stars tiers are priced for a tap; a card payment has a floor below
+        # which the processor's own fee eats most of it, so the bottom tier
+        # is $1 rather than $0.30.
+        "options": [1, 3, 5, 10], "min_minor": 100, "max_minor": 1_000_000,
     },
 }
 
 
+# ---- the freeze ----
+# Real-currency donations are FROZEN as of v1.3.0. The code below is
+# complete and stays complete; what it does is nothing.
+#
+# Why frozen rather than deleted: connecting a provider is a decision about
+# payouts and a country, not about this file, and the day it is made the work
+# should already be done. Deleting it would mean rewriting the button grid,
+# the amount validation, the invoice call, the ledger's currency column and
+# three languages' worth of strings, all of which exist and all of which
+# work.
+#
+# Why frozen rather than just left unconfigured: it already did nothing
+# without PAYMENT_PROVIDER_TOKEN_USD, but "does nothing because a variable
+# happens to be empty" is one accidental deploy-variable away from a half-
+# enabled payment path -- an invoice offered on a rail that cannot take it,
+# in front of a real user. One flag, checked at the single point every fiat
+# path already goes through, so the freeze cannot be lifted by accident.
+#
+# To unfreeze: set FIAT_DONATIONS=on AND PAYMENT_PROVIDER_TOKEN_USD=<token>.
+# Both, deliberately. Nothing else has to change.
+FIAT_DONATIONS = os.environ.get("FIAT_DONATIONS", "off").lower() in ("on", "1", "true", "yes")
+
+
 def _fiat_provider_token(currency: str) -> str | None:
+    """The one chokepoint. Every fiat path in this file asks this first --
+    the button grid via _available_fiat_currencies, `/donate 5 usd` before it
+    validates anything, and _send_donation_invoice before it calls Telegram
+    -- so returning None here is the whole freeze, and no other function
+    needed a line changed to honour it."""
+    if not FIAT_DONATIONS:
+        return None
     return os.environ.get(f"PAYMENT_PROVIDER_TOKEN_{currency}") or None
 
 
@@ -234,38 +428,106 @@ def _donation_nudge_due(user_id: int) -> bool:
     """Blocking; the async wrapper below is what handlers call. One statement
     to bump-and-read, and a second one only in the rare case where the nudge
     actually fires."""
-    count, last_shown = db.bump_donation_action(user_id)
+    count, last_shown, times_shown, donated = db.bump_donation_action(user_id)
 
-    days_since = None
+    if donated:
+        return False
+    if times_shown >= len(DONATION_STEPS):
+        return False  # asked three times across 275 actions; that is an answer
+
     if last_shown:
         days_since = (datetime.now(timezone.utc) - datetime.fromisoformat(last_shown)).days
         if days_since < DONATION_COOLDOWN_FLOOR_DAYS:
-            return False  # hard floor -- never nag twice in quick succession
+            return False  # hard floor -- never twice in quick succession
 
-    hit_action_threshold = count >= DONATION_ACTION_THRESHOLD
-    # Time alone shouldn't fire for someone who's barely touched the bot --
-    # require at least a handful of actions too.
-    hit_time_threshold = (days_since is None or days_since >= DONATION_MIN_DAYS_BETWEEN) and count >= 3
+    if count < DONATION_STEPS[times_shown]:
+        return False
 
-    if hit_action_threshold or hit_time_threshold:
-        db.reset_donation_prompt(user_id)
-        return True
-    return False
+    db.reset_donation_prompt(user_id)
+    return True
 
 
-async def maybe_donation_nudge(user_id: int, lang: str) -> str | None:
+async def maybe_donation_nudge(user_id: int, lang: str, context=None, chat_id: int | None = None) -> str | None:
     """Await right after a successful action. Returns text to append to your
     reply, or None most of the time (send nothing).
 
     Async because it writes to the database, and this is called on the
     success path of the bot's main job -- doing it inline on the event loop
-    stalls every other user's update for the round trip."""
+    stalls every other user's update for the round trip.
+
+    `context` and `chat_id` are only used when DONATION_PIN is on, in which
+    case the nudge is sent as its own message and pinned rather than handed
+    back to be appended -- there is nothing to pin about a sentence glued to
+    the end of somebody else's reply. That path returns None, so a caller
+    that passes them and one that does not both do the right thing with the
+    return value.
+    """
     try:
         due = await asyncio.to_thread(_donation_nudge_due, user_id)
     except Exception:
         logging.getLogger(__name__).debug("Donation nudge check failed", exc_info=True)
         return None
-    return i18n.t(lang, "donation_nudge") if due else None
+    if not due:
+        return None
+    text = i18n.t(lang, "donation_nudge")
+    if DONATION_PIN and context is not None and chat_id is not None:
+        await _pin_donation_nudge(context, user_id, chat_id, text)
+        return None
+    return text
+
+
+async def _pin_donation_nudge(context, user_id: int, chat_id: int, text: str) -> None:
+    """Send the nudge on its own and pin it, replacing any earlier one.
+
+    Every step is best-effort. A pin that fails must not cost the user the
+    action they actually asked for, and pinning is the sort of thing
+    Telegram refuses for reasons outside this bot's control -- a chat
+    cleared, a message older than the pin limit, a client that unpinned it
+    already. `disable_notification=True` because a nudge that pings someone's
+    phone is worse than one that does not; it still leaves the "pinned a
+    message" service line, which is one of the reasons this is off by
+    default.
+    """
+    try:
+        previous = await asyncio.to_thread(db.get_pinned_donation_message, user_id)
+    except Exception:
+        previous = None
+    if previous:
+        try:
+            await context.bot.unpin_chat_message(chat_id=chat_id, message_id=previous)
+        except Exception:
+            logging.getLogger(__name__).debug("Could not unpin the previous nudge", exc_info=True)
+    try:
+        sent = await context.bot.send_message(chat_id=chat_id, text=text)
+        await context.bot.pin_chat_message(
+            chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not pin the donation nudge", exc_info=True)
+        return
+    try:
+        await asyncio.to_thread(db.set_pinned_donation_message, user_id, sent.message_id)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not record the pinned nudge", exc_info=True)
+
+
+async def unpin_donation_nudge(context, user_id: int, chat_id: int) -> None:
+    """Called when somebody donates. Whatever the cadence says, the ask is
+    over for this person -- and leaving it pinned would make a thank-you look
+    like a repeat request."""
+    try:
+        previous = await asyncio.to_thread(db.get_pinned_donation_message, user_id)
+    except Exception:
+        return
+    if not previous:
+        return
+    try:
+        await context.bot.unpin_chat_message(chat_id=chat_id, message_id=previous)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not unpin after a donation", exc_info=True)
+    try:
+        await asyncio.to_thread(db.set_pinned_donation_message, user_id, None)
+    except Exception:
+        pass
 
 
 async def _send_donation_invoice(chat_id: int, user, context, amount: int, lang: str, currency: str = "XTR") -> str | None:
@@ -274,6 +536,12 @@ async def _send_donation_invoice(chat_id: int, user, context, amount: int, lang:
     success, or an error message to show the sender if Telegram itself
     rejects the amount/currency (e.g. above Telegram's own per-invoice cap,
     or no provider connected for that currency)."""
+    if currency != "XTR" and not _fiat_provider_token(currency):
+        # Belt and braces. Nothing reaches here with a frozen currency today
+        # -- every caller checks first -- and the cost of being wrong about
+        # that is an invoice a user cannot pay, so it is checked again before
+        # anything is written to the ledger.
+        return i18n.t(lang, "donate_currency_not_configured", currency=currency)
     payload = f"donate:{uuid.uuid4().hex}"
     await asyncio.to_thread(
         db.record_star_invoice, user.id, user.username, amount, "donation", payload,
@@ -328,6 +596,9 @@ async def donate_command(update, context) -> None:
             if requested not in FIAT_CURRENCIES:
                 await update.message.reply_text(i18n.t(lang, "donate_unknown_currency", currency=context.args[1]))
                 return
+            # Frozen or unconfigured both land here, and the sentence is the
+            # same either way -- "not set up on this bot" is true of both and
+            # is what the user needs to know. See FIAT_DONATIONS above.
             if not _fiat_provider_token(requested):
                 await update.message.reply_text(i18n.t(lang, "donate_currency_not_configured", currency=requested))
                 return
@@ -465,6 +736,10 @@ async def donation_payment_received(update, context) -> None:
     )
     lang = await i18n.get_lang(update.effective_user.id, context)
     await update.message.reply_text(i18n.t(lang, "donate_thanks", amount=sp.total_amount))
+    # The ask is over for this person -- _donation_nudge_due checks the same
+    # paid row and will never fire again, and anything still pinned comes
+    # down now rather than sitting above a thank-you.
+    await unpin_donation_nudge(context, user.id, update.effective_chat.id)
 
 
 # ---- full standalone handlers, for bots (like StickerBot) whose ONLY Stars
@@ -976,9 +1251,16 @@ async def _flush_activity_job(context) -> None:
 
 
 async def track_activity(update, context) -> None:
-    """Register as a TypeHandler(Update, track_activity, ...) in group=-1
-    (runs before every other handler, but doesn't stop them) so /status can
-    report active users hourly / since this process started.
+    """Register as a TypeHandler(Update, track_activity, ...) in a group of
+    its OWN, above every other group, so /status can report active users
+    hourly / since this process started.
+
+    Its own group is not a style choice. python-telegram-bot runs at most one
+    handler per group -- the first match wins and the rest of that group is
+    skipped -- and this one matches every update there is. Anything sharing a
+    group with it therefore never runs at all, silently, which is exactly
+    what happened to the four bots' donate_custom_amount_received and to
+    AnonBot's edited_message handler until v1.2.2R.
 
     Does no I/O at all now -- it adds an int to a set, and the job registered
     by attach_maintenance() writes the window out. It also stamps this user's

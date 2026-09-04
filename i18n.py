@@ -36,6 +36,21 @@ LANGUAGE_PROMPT = (
 
 STRINGS = {
     "en": {
+        "quota_hour": (
+            "You've had {used} downloads in the last hour, which is this bot's limit "
+            "({limit}/hour) -- it's there so everyone gets a turn on a small server. "
+            "The next one frees up in about {minutes} minute(s)."
+        ),
+        "quota_day": (
+            "You've had {used} downloads today, which is this bot's daily limit "
+            "({limit}) -- it's there so everyone gets a turn on a small server. "
+            "It frees up again in about {minutes} minute(s)."
+        ),
+        "quota_donor_hint": (
+            "If you need more: anyone who has ever chipped in via /donate gets a much "
+            "higher limit, permanently. One donation of any size is enough."
+        ),
+        "flood_wait": "You're going faster than I can keep up with -- give it about {seconds} second(s) and carry on.",
         # ---- shared keys (same name in every bot's i18n.py) ----
         "sibling_blurb": "Also part of this bot family, see below \U0001f447",
         "donation_nudge": (
@@ -128,6 +143,21 @@ STRINGS = {
         "unknown_command": "I don't recognize that command. Send /help to see what I can do.",
     },
     "uz": {
+        "quota_hour": (
+            "Oxirgi bir soatda {used} ta yuklab oldingiz -- bu botning chegarasi "
+            "(soatiga {limit}). Kichik serverda hammaga navbat yetishi uchun shunday. "
+            "Keyingisi taxminan {minutes} daqiqadan keyin bo'shaydi."
+        ),
+        "quota_day": (
+            "Bugun {used} ta yuklab oldingiz -- bu botning kunlik chegarasi ({limit}). "
+            "Kichik serverda hammaga navbat yetishi uchun shunday. Taxminan {minutes} "
+            "daqiqadan keyin yana ochiladi."
+        ),
+        "quota_donor_hint": (
+            "Ko'proq kerak bo'lsa: /donate orqali biror marta yordam bergan har kimga "
+            "chegara doimiy ravishda ancha yuqori qilib qo'yiladi. Miqdori muhim emas."
+        ),
+        "flood_wait": "Siz men ulgurganimdan tezroq yuboryapsiz -- taxminan {seconds} soniya kutib, davom eting.",
         "sibling_blurb": "Bu bot oilasining bir qismi, pastda ko'ring \U0001f447",
         "donation_nudge": (
             "💙 Agar bu bot foydali bo'lgan bo'lsa: hosting/API xarajatlarini uni ishga "
@@ -219,6 +249,21 @@ STRINGS = {
         "unknown_command": "Bu buyruqni tanimadim. Nima qila olishimni bilish uchun /help yuboring.",
     },
     "ru": {
+        "quota_hour": (
+            "За последний час ты скачал {used} — это предел этого бота ({limit} в час). "
+            "Он нужен, чтобы на маленьком сервере хватало всем. Следующая попытка "
+            "освободится примерно через {minutes} минут(ы)."
+        ),
+        "quota_day": (
+            "Сегодня ты скачал {used} — это дневной предел бота ({limit}). Он нужен, "
+            "чтобы на маленьком сервере хватало всем. Снова откроется примерно через "
+            "{minutes} минут(ы)."
+        ),
+        "quota_donor_hint": (
+            "Если нужно больше: у всех, кто хоть раз поддержал бота через /donate, "
+            "предел заметно выше и навсегда. Сумма значения не имеет."
+        ),
+        "flood_wait": "Ты отправляешь быстрее, чем я успеваю -- подожди примерно {seconds} секунд(ы) и продолжай.",
         "sibling_blurb": "Тоже часть этой семьи ботов, смотри ниже \U0001f447",
         "donation_nudge": (
             "💙 Если этот бот оказался полезным: расходы на хостинг/API покрывает тот, "

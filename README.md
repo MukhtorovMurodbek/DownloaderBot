@@ -1,173 +1,171 @@
 # DownloaderBot
 
-Telegram bot that downloads media from a pasted link and sends it back — no
-command needed, just paste a link.
+A Telegram bot that downloads media from a pasted link and sends it back. No
+command is needed — pasting a supported link is the whole interface.
 
-- **Instagram**: reels, photo posts and carousels.
-- **TikTok**: videos without the watermark, and photo slideshows.
-- **Twitter/X**: video and photos; a text-only tweet becomes a clean image
-  "card" instead of a wall of text.
-- **Pinterest**: the pin's image at full resolution, or the video for a
-  video pin.
-- **Reddit**: media posts download directly; text/link posts get a card.
+| platform | what it returns |
+|---|---|
+| Instagram | Reels, photo posts and carousels |
+| TikTok | Videos without the watermark, and photo slideshows |
+| Twitter / X | Video and photos; a text-only post is rendered as an image card |
+| Pinterest | The pin's image at full resolution, or its video |
+| Reddit | Media posts directly; text and link posts as an image card |
 
-## How it gets them, and why that took a rewrite
+Runs as its own process, its own repository and its own deployment, and can
+be run entirely standalone. It shares a Postgres database with four sibling
+bots only in the sense that its tables live in a schema of their own inside
+it (`DB_SCHEMA`); no other bot reads or writes them. The one shared area is
+`family.*`, where the bot posts a heartbeat and any crash so a monitoring bot
+can watch it — `FAMILY_BUS=off` disables that entirely.
 
-Instagram and YouTube decide what to serve partly from **where** the request
-comes from. Every cloud host's address sits in a published datacenter range,
-and those ranges get a login page where a phone gets the post. Until v1.2.1
-this bot had exactly one way to fetch anything — yt-dlp, from inside its own
-container — so Instagram stopped working entirely and said so politely.
+---
 
-`resolvers.py` fixes that by not making the request from here. Each platform
-has a **chain of independent routes**, mostly public services that fetch on
-their own infrastructure and hand back either a direct CDN link or a copy
-proxied through themselves; whether this container is on a blocked range
-stops mattering. yt-dlp is still in every chain, but last, because it is the
-one route that goes out from this address — and the only one that gets better
-the moment a cookie file or proxy is configured.
+## Where a download actually comes from
 
-Any one of those services is mortal: they get bought, rate-limited, sued, or
-simply stop resolving in DNS. So the bot keeps score. Every attempt is
-recorded per route in its own `provider_health` table, a route that keeps
-failing is moved to the back of its chain and retried more and more rarely
-(never dropped — a chain where everything is resting still tries everything),
-and a single success puts it straight back at the front. Nothing needs a
-human to notice a service has died.
+This is the part of the bot worth understanding before reading any of it.
 
-- `/providers` (owner-only) — what the live bot has learned from real traffic.
-- **`/run downloaderbot probe`** (through ParentBot) — asks every route *from
-  inside the deployed container*. This is the one that settles arguments:
-  every route was verified on a laptop, and a laptop is on a residential
-  address, which is the exact thing these sites treat differently. Add
-  platform names (`probe instagram tiktok`) or paste real links to narrow it.
-- `python probe.py` — the same checks from a terminal, wherever you run it.
+Several of these sites decide what to serve partly from **where the request
+comes from**. Every cloud host's addresses sit in published datacenter
+ranges, and those ranges are served a login page where a residential
+connection is served the post. A downloader that makes its requests from
+inside its own container therefore works on a laptop and fails in
+production, for reasons that look like bugs and are not.
 
-Both probes ask every route rather than stopping at the first that works, and
-neither touches the health scores: a probe is a question, not traffic.
+So the bot does not have one way to fetch a link. Each platform has a
+**chain of independent providers**, tried in order, and the chain remembers
+what it learns:
 
-Read `resolvers.py`'s docstring before changing any of it. `platforms.py` is
-now just link recognition plus the two page reads that feed the cards, and
-`cards.py` is the card renderer.
+- A provider that fails does not end the attempt; the next one is tried.
+- Repeated failures move a provider to the back of its chain and rest it for
+  a while, with the delay growing each time — rather than removing it, since
+  most of these outages are temporary.
+- A chain whose every member is resting still tries every member. "The site
+  is slow today" and "the bot is broken" are different answers and only one
+  of them is worth showing.
+- Requests that go out from the container's own address are tried **last**,
+  because that is the address these sites treat differently.
 
-This bot is its own process, its own repo and its own deployment — it can
-be run entirely on its own. It shares one Postgres database with the rest
-of the family, but only in the sense that its tables live in their own
-schema inside it (`DB_SCHEMA` in `.env`); no other bot reads or writes
-them. The exception is `family.*`, where this bot posts a heartbeat and
-any crash so that ParentBot can watch it — see `family_link.py`, and
-ARCHITECTURE.md in the family monorepo for why it is arranged this way. Set `FAMILY_BUS=off`
-to opt out of that entirely.
+`/providers` prints what the chain currently believes, per platform, with
+each provider's success and failure counts and its last error. `/probe`
+actively tries every route against known-good sample posts and reports what
+happened, which answers "is it broken, or was that one post private".
+
+---
 
 ## Commands
 
-- (paste a supported link any time) — downloads and sends it back
-- `/caption on|off` — toggle the "via @thisbot" credit caption
-- `/lossless on|off` — send downloads as files instead of as photos and
-  videos. Telegram re-encodes anything sent as media — that compression is
-  what makes it play inline, and there is no way to have both — so with
-  this on the bytes arrive exactly as the source had them, at the cost of a
-  tap to open and no preview in the chat. Off by default, remembered per
-  user. Bare `/lossless` shows the current state with buttons
-- `/donate` — chip in for hosting costs (voluntary, Telegram Stars)
-- `/cancel` — asks which of the things it is waiting on you for to stop,
-  as one button each, and stops nothing until you pick. With nothing pending
-  it says so straight away, as it always did
-- `/start` — the full instructions. The first `/start` from a brand-new
-  user asks for a language before printing them, which is the one and only
-  time it asks; after that it prints them in the language on record
-- `/language` — the picker on demand: a short greeting in all three
-  languages and one row of buttons, with a tick on the language in force.
-  Choosing one (even the one already set) reprints the instructions in it
-- `/en`, `/uz`, `/rus` — switch language directly, skipping the picker;
-  each also reprints the instructions in the language just chosen
-- `/help` — the instructions on their own
+| command | what it does |
+|---|---|
+| *(paste a link)* | Downloads it and sends it back |
+| `/lossless on\|off` | Send downloads as files rather than as photos and videos. Telegram re-encodes anything sent as media — that compression is what makes it play inline, and there is no way to have both — so with this on the bytes arrive exactly as the source had them, at the cost of a tap to open. Off by default, remembered per user. |
+| `/caption on\|off` | Toggle the credit caption. |
+| `/cancel` | Asks which of the things the bot is waiting on should stop, one button each. |
+| `/donate` | Voluntary contribution towards hosting, paid in Telegram Stars. |
+| `/start` | Instructions. The first `/start` from a new user asks which language to use, once. |
+| `/language`, `/en`, `/uz`, `/rus` | Switch language. Each reprints the instructions in the language chosen. |
+| `/help` | The instructions on their own. |
 
-Owner-only (requires `DBOT_ADMIN_ID` in `.env` — silently do nothing for
-everyone else):
-- `/messageas <user_id> <text>` — send a message to that user as this bot
-- `/dbdump` — export this bot's tables as a zip of CSVs
-- `/status` — uptime, host, crashes since this process started, active users
-- `/providers` — which download route is currently working, per platform,
-  with the failure streak and last error for the ones that are not
+Restricted to the account ids in `DBOT_ADMIN_ID`, and answering everyone else
+exactly as a misspelt command does: `/providers`, `/probe`,
+`/messageas <user_id> <text>`, `/dbdump` and `/status`.
 
-## Setup
+---
 
-1. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-2. Copy `.env.example` to `.env` and fill in `DBOT_TOKEN`/`DBOT_USERNAME`
-   (from [@BotFather](https://t.me/BotFather)). Optionally set `DBOT_ADMIN_ID`
-   to your own numeric user id(s) to unlock `/dbdump`.
-3. Start the family's shared Postgres, from the monorepo root:
-   ```
-   docker compose up -d
-   ```
-   That is one database (`botfamily`) for all five bots, with a schema
-   each — this one uses `DB_SCHEMA=downloader_bot`. No Docker? Install
-   Postgres directly and point `DATABASE_URL` at it instead.
-4. Run it:
-   ```
-   python bot.py
-   ```
+## Limits
 
-## Deploying (e.g. Railway)
+This is the bot in its family with real resource spikes — a fetch, an
+`ffmpeg` mux and an upload, all at once — so it is bounded on three axes:
 
-The short version is below; DEPLOY.md in the family monorepo covers all five in one
-pass, which is easier than doing five of these separately.
+- **Two downloads at a time** across the whole process, which is what stops
+  ten links pasted in one minute from becoming ten simultaneous downloads.
+- **One of those slots per person**, so nobody can hold both and leave
+  everyone else queueing behind a stranger.
+- **A rolling hourly and daily allowance per person**, counted in the
+  database so a redeploy does not reset it. Anyone who has contributed
+  through `/donate` gets a larger allowance, permanently and for any amount.
 
-1. Point `DATABASE_URL` at the family's Postgres, and set `DB_SCHEMA` to
-   `downloader_bot`. On Railway that first one is a reference variable,
-   `${{Postgres.DATABASE_URL}}`, so several services can share one database.
-2. Set `DBOT_TOKEN`, `DBOT_USERNAME`, and the rest of `.env` as environment
-   variables on the service.
-3. Deploy — `pip install -r requirements.txt` then `python bot.py`.
+All three are configurable; see `.env.example`. Size and duration ceilings
+stop a mis-pasted link to a three-hour stream before the first byte is
+fetched.
 
-### Updating a running bot
+---
 
-Pushing an update replaces the container, and the bots are set up so nobody
-notices: the new process waits on a Postgres advisory lock until the old one
-has stopped polling (no 409 Conflict, no split updates), open conversations
-and half-finished sessions are restored from the `runtime_state` table in
-this bot's own schema, and anyone whose upload was mid-flight is told to send
-it again rather than left waiting. Updates sent during the gap are held by
-Telegram and delivered on the first poll.
+## Running it
 
-`../UPDATES.md` has the whole picture, including what to check after a push.
-`DEPLOY_SAFETY=off` turns all of it off and restores the old behaviour.
-
-## Keeping a local and cloud database in sync
-
-If you ever run this bot from both your laptop and the cloud at different
-times, `db_merge.py` reconciles the two additively (never deletes or
-overwrites anything):
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # fill in DBOT_TOKEN and DBOT_USERNAME
+python bot.py
 ```
-python db_merge.py --from local --into cloud --dry-run   # preview first
-python db_merge.py --from local --into cloud             # actually do it
+
+`DBOT_TOKEN` and `DBOT_USERNAME` come from
+[@BotFather](https://t.me/BotFather). `DBOT_ADMIN_ID` is optional and takes
+one or more numeric account ids.
+
+The bot needs a Postgres database (`DATABASE_URL`, with `DB_SCHEMA`
+defaulting to `downloader_bot`) and `ffmpeg` on `PATH`. The schema and its
+tables are created on first run.
+
+Two optional settings materially change how well Instagram works from a
+datacenter: `DBOT_IG_COOKIES_FILE` and `DBOT_IG_PROXY`. Both are documented
+in `.env.example`.
+
+### Deploying
+
+Set the same values as environment variables on the host and run
+`python bot.py`. `railway.json` and `nixpacks.toml` configure a Railway
+deployment; neither is required elsewhere.
+
+A deployment replaces the running container, and the bot is built so that
+costs as little as possible. The new process waits on a Postgres advisory
+lock until the old one has stopped polling, so Telegram never sees two
+consumers of one token. What each provider had learned is written to the
+database, so a restart does not go back to hammering a route that has been
+dead for a week. A download that was running when the signal arrived cannot
+survive — the container is going — so the person is told, rather than left
+watching a message that will never finish. Updates sent during the gap are
+held by Telegram and delivered on the first poll. `DEPLOY_SAFETY=off`
+disables the deploy machinery.
+
+### Keeping two databases in sync
+
+`db_merge.py` reconciles a local database with a remote one additively — it
+never deletes or overwrites.
+
+```bash
+python db_merge.py --from local --into cloud --dry-run
+python db_merge.py --from local --into cloud
 ```
-Read the script's docstring for exactly how conflicts are handled.
 
-## Optional: cross-promoting sibling bots
-
-If you're running this alongside other bots (e.g. a sticker or converter
-bot) and want each to mention the others in `/start`/`/help`, set
-`SIBLING_BOTS` in `.env` — see the comment in `shared_features.py`. Purely
-cosmetic (display text + link buttons); no database or file is shared.
+---
 
 ## Files
 
-- `bot.py` — handlers and the per-platform routing
-- `platforms.py` — link recognition + Pinterest/Reddit/Twitter fetch logic
-- `cards.py` — the Reddit/Twitter text-post "card" image renderer (Pillow)
-- `db.py` — this bot's own Postgres schema and queries
-- `family_link.py` — heartbeats, crash reporting, and the queue ParentBot
-  uses to run this bot's owner-only commands (identical in every bot)
-- `live_message.py` — the rule that a bot message only keeps evolving while
-  it is still the last thing in the chat (identical in every bot)
-- `lifecycle.py` — surviving a redeploy: one poller at a time, state kept in
-  Postgres, in-flight work announced (identical in every bot)
-- `shared_features.py` — `/donate` (Telegram Stars) + sibling-bot cross-promotion
-- `video.py` — the yt-dlp video download (Instagram/TikTok/YouTube, and
-  Reddit/Twitter video posts)
-- `db_merge.py` — reconciles a laptop database with the cloud one, additively (see above)
+| file | |
+|---|---|
+| `bot.py` | Handlers, the send path, and the per-person limits |
+| `resolvers.py` | The provider chains, their health, and the probe |
+| `platforms.py` | Which links are recognised, and the platform-specific fetches |
+| `net.py`, `video.py` | Bounded HTTP, and the video download |
+| `cards.py` | Rendering a text post as an image |
+| `db.py` | This bot's schema, provider health, allowances, connection pool |
+| `i18n.py` | English, Uzbek and Russian strings |
+| `family_link.py` | Heartbeats, crash reporting, and the command queue a monitoring bot uses |
+| `lifecycle.py` | Surviving a redeploy: one poller at a time, state in Postgres |
+| `live_message.py` | When a bot message may keep evolving in place |
+| `shared_features.py` | Donations, logging, activity tracking, flood control |
+| `db_merge.py` | Reconciles two databases, additively |
+
+`family_link.py`, `lifecycle.py`, `live_message.py` and `shared_features.py`
+are shared with the sibling bots by being copied rather than imported: each
+bot is a separate deployment, so nothing crosses a repository boundary.
+
+## Requirements
+
+Python 3.11 or newer, Postgres 16 or newer, and `ffmpeg`.
+
+## A note on scope
+
+This bot downloads publicly accessible posts on behalf of the person asking
+for them. It is not a way around a private account, and it does not attempt
+to be. Whoever runs it is responsible for how it is used where they run it.

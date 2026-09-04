@@ -40,6 +40,7 @@ import asyncio
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -91,9 +92,12 @@ from db import (
     count_active_users_since,
     load_provider_health,
     save_provider_health,
+    download_allowance,
+    record_download,
 )
 from shared_features import (
     refuse_new_work,
+    attach_flood_gate,
     attach_maintenance,
     CANCEL_PICK_ALL,
     CANCEL_PICK_NONE,
@@ -186,6 +190,32 @@ def _slots() -> asyncio.Semaphore:
     if _download_slots is None:
         _download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     return _download_slots
+
+
+# ...and no more than one of those slots to any one person. Two global slots
+# is a limit on the box; it is not a share of the box, and one person pasting
+# two links at once takes both of them and leaves everyone else queueing
+# behind a stranger. One each means the second slot is always there for the
+# next person to arrive. It costs the heavy user nothing but sequence: their
+# second link starts when their first finishes, which is what the
+# "Downloading..." message already implies.
+_user_slots: "dict[int, asyncio.Lock]" = {}
+
+
+@asynccontextmanager
+async def _user_slot(user_id: int):
+    lock = _user_slots.get(user_id)
+    if lock is None:
+        lock = _user_slots[user_id] = asyncio.Lock()
+    try:
+        async with lock:
+            yield
+    finally:
+        # Dropped as soon as it is idle: one dict entry per person who has
+        # ever pasted a link is a slow leak on a process that runs for
+        # months, and re-creating a Lock costs nothing.
+        if not lock.locked() and not lock._waiters:  # noqa: SLF001 - no public API for this
+            _user_slots.pop(user_id, None)
 
 
 def build_help_text(lang: str) -> str:
@@ -587,6 +617,27 @@ async def providers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     if not _is_admin(update.effective_user.id):
         return await _deny(update, context)
+    await update.message.reply_text(_providers_text(), **NO_PREVIEW)
+
+
+async def _bus_providers(context, args):
+    """The same report, asked for from ParentBot (`/providers downloader`).
+
+    Every owner-only command in this family should be reachable from
+    ParentBot, and this one was not -- which mattered more than most, because
+    the question it answers ("which route is broken right now") is one you
+    ask when something is already wrong and you are not sitting in this bot's
+    chat.
+
+    It reads the in-process health table, so it answers for the container
+    that is actually serving downloads. `probe` beside it is the active
+    version of the same question: this says what has been happening, probe
+    goes and finds out.
+    """
+    return _providers_text(), None, None
+
+
+def _providers_text() -> str:
     now = time.time()
     lines = []
     for platform, chain in resolvers.PROVIDERS.items():
@@ -607,9 +658,7 @@ async def providers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 mark = "\u26a0\ufe0f"
                 note = f"{h.streak} in a row: {resolvers.tidy_error(h.last_error)}"
             lines.append(f"  {mark} {name} -- {h.ok} ok / {h.failed} failed, {note}")
-    await update.message.reply_text(
-        "Download routes, best first per platform:" + "\n".join(lines),
-        **NO_PREVIEW)
+    return "Download routes, best first per platform:" + "\n".join(lines)
 
 
 def _ago(seconds: float) -> str:
@@ -632,7 +681,8 @@ def _nudge_kb() -> InlineKeyboardMarkup | None:
 
 
 async def _after_send(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
-    nudge = await maybe_donation_nudge(update.effective_user.id, lang)
+    nudge = await maybe_donation_nudge(
+        update.effective_user.id, lang, context, update.effective_chat.id)
     if nudge:
         await update.message.reply_text(nudge)
 
@@ -771,8 +821,8 @@ async def _resolve_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await status.set(context.bot, i18n.t(lang, "queued"))
 
     paths: list[str] = []
-    async with _slots(), lifecycle.busy(update.effective_chat.id,
-                                        i18n.t(lang, "restarting_send_again")):
+    async with _user_slot(update.effective_user.id), _slots(), lifecycle.busy(
+            update.effective_chat.id, i18n.t(lang, "restarting_send_again")):
         try:
             resolved = await resolvers.resolve(platform, url)
         except resolvers.NothingWorked as exc:
@@ -903,6 +953,23 @@ async def _handle_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
     await status.set(context.bot, i18n.t(lang, "twitter_fetch_failed_link", url=url))
 
 
+def _allowance_message(lang: str, allowance: dict) -> str:
+    """What somebody who has run out is told.
+
+    Three things, in this order: that there is a limit and it is not
+    personal, when it lifts, and -- only for people who have not already
+    given -- that donating moves it. Asking a donor to donate is how a
+    thank-you turns into a nag, and the ledger already knows.
+    """
+    key = ("quota_hour" if allowance["scope"] == "hour" else "quota_day")
+    text = i18n.t(lang, key, used=allowance[allowance["scope"]],
+                  limit=allowance[f"{allowance['scope']}_max"],
+                  minutes=allowance["wait_min"])
+    if not allowance["donor"]:
+        text += "\n\n" + i18n.t(lang, "quota_donor_hint")
+    return text
+
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     detected = platforms.detect_platform(update.message.text)
     if not detected:
@@ -922,6 +989,20 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if refusal:
         await update.message.reply_text(refusal)
         return
+
+    # A share of the day, per person. MAX_CONCURRENT_DOWNLOADS above stops
+    # the box falling over; this is the different problem of one person
+    # holding both of its slots all afternoon while everybody else queues
+    # behind them. Checked here rather than inside the download so a refused
+    # link costs one query instead of a fetch -- and here rather than in each
+    # of the three branches below, because the Reddit and Twitter paths cost
+    # the same fetches and used to be the way past a limit that only the
+    # video path enforced.
+    allowance = await asyncio.to_thread(download_allowance, update.effective_user.id)
+    if not allowance["allowed"]:
+        await update.message.reply_text(_allowance_message(lang, allowance))
+        return
+    await asyncio.to_thread(record_download, update.effective_user.id, platform)
 
     if platform == "reddit":
         await _handle_reddit(update, context, url)
@@ -995,7 +1076,17 @@ def main():
     app = builder.build()
     lifecycle.install(app, BOT_NAME)
     app.add_error_handler(error_handler)
-    app.add_handler(TypeHandler(Update, track_activity), group=-1)
+    # ---- the handlers that run before everything else ----
+    # ONE GROUP EACH, and that is the whole point. python-telegram-bot runs
+    # at most ONE handler per group: the first whose filter matches wins and
+    # the rest of that group is skipped. track_activity is a TypeHandler on
+    # Update, so it matches every update there is -- which meant that for as
+    # long as these shared a group, it won every time and nothing else here
+    # ever ran. Separate groups, in the order they have to happen in.
+    app.add_handler(TypeHandler(Update, track_activity), group=-4)
+    # Counted first, then throttled: somebody who floods is still somebody
+    # who was here, and /status is supposed to say so.
+    attach_flood_gate(app, ADMIN_IDS)
     # Runs after track_activity but before every other handler -- a no-op
     # unless a "Custom" donate button was just tapped, in which case it
     # consumes the reply and stops it from also being treated as a normal
@@ -1046,6 +1137,9 @@ def main():
     family_link.COMMANDS["probe"] = _bus_probe
     family_link.COMMAND_HELP["probe"] = (
         "probe [platform|url ...] -- try every download route from in here")
+    family_link.COMMANDS["providers"] = _bus_providers
+    family_link.COMMAND_HELP["providers"] = (
+        "which download route is working and which is resting")
     attach_maintenance(app)
 
     logger.info("Bot starting (polling)...")

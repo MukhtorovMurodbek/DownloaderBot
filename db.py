@@ -317,6 +317,15 @@ def init_db(dsn: str = DATABASE_URL) -> None:
             )
             """
         )
+        # How many times this person has ever been shown the nudge. The
+        # cadence is a schedule that runs out rather than a loop (see
+        # DONATION_STEPS in shared_features.py), and this is the step counter
+        # it reads. Safe to re-run on an existing table.
+        conn.execute("ALTER TABLE donation_prompts ADD COLUMN IF NOT EXISTS times_shown INTEGER NOT NULL DEFAULT 0")
+        # Set only when DONATION_PIN is on: the message this bot pinned, so
+        # it can be unpinned again when they donate or when a newer nudge
+        # replaces it.
+        conn.execute("ALTER TABLE donation_prompts ADD COLUMN IF NOT EXISTS pinned_message_id BIGINT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS activity_events (
@@ -328,6 +337,30 @@ def init_db(dsn: str = DATABASE_URL) -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_activity_events_occurred_at ON activity_events (occurred_at)"
+        )
+        # One row per download this bot actually started for somebody.
+        #
+        # In the database rather than in memory, which is the opposite choice
+        # to the per-minute update ceiling in shared_features.py, and for the
+        # opposite reason: that one is defending the process against a burst,
+        # so forgetting it on a redeploy costs nothing. This one is a share
+        # of a day, and a limit that resets every time the owner ships is not
+        # a limit -- it would hand the heaviest user a fresh allowance on
+        # every deploy, which is several a day when anything is being worked
+        # on.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS download_events (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                platform TEXT,
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_download_events_user_time "
+            "ON download_events (user_id, occurred_at DESC)"
         )
         # Which download provider is currently working, and which is not.
         #
@@ -379,6 +412,17 @@ def count_active_users_since(since) -> int:
         )
         return cur.fetchone()[0]
 
+
+
+def active_user_ids_since(since) -> list[int]:
+    """Everyone with activity since `since`. Used by the family bus for an
+    aimed broadcast -- see BROADCAST_ACTIVE_DAYS in family_link.py."""
+    with pooled_read() as conn:
+        cur = conn.execute(
+            "SELECT DISTINCT user_id FROM activity_events WHERE occurred_at >= %s",
+            (since,),
+        )
+        return [row[0] for row in cur.fetchall()]
 
 def list_all_users() -> list[int]:
     """Everyone this bot could send an unprompted message to.
@@ -501,41 +545,185 @@ def update_star_transaction(payload: str, status: str, charge_id: str | None = N
 
 # ---------- donation-reminder cooldown ----------
 
-def bump_donation_action(user_id: int) -> tuple[int, str | None]:
-    """Increments this user's action counter and returns (new total, when the
-    nudge was last shown). One statement, because this runs on the success
-    path of every completed action and the two halves were previously two
-    separate round trips."""
+def bump_donation_action(user_id: int) -> tuple[int, str | None, int, bool]:
+    """Increments this user's action counter and returns everything the nudge
+    decision needs: (actions since the last nudge, when it was last shown,
+    how many times it has ever been shown, has this person ever donated).
+
+    One statement. This runs on the success path of every completed action --
+    every finished pack, every conversion, every download -- so it is one of
+    the hottest writes in the family, and the database is on another
+    continent. The donation check used to be two round trips and the "have
+    they already given" question would have made it three.
+
+    `times_shown` is what turns the cadence from "every N actions forever"
+    into a schedule that runs out: see DONATION_STEPS in shared_features.py.
+    The paid check is what stops the bot thanking somebody by asking them
+    again.
+    """
     with pooled() as conn:
         cur = conn.execute(
             """
-            INSERT INTO donation_prompts (user_id, action_count, last_shown_at)
-            VALUES (%s, 1, NULL)
-            ON CONFLICT (user_id) DO UPDATE SET action_count = donation_prompts.action_count + 1
-            RETURNING action_count, last_shown_at
+            WITH bumped AS (
+                INSERT INTO donation_prompts (user_id, action_count, last_shown_at)
+                VALUES (%(uid)s, 1, NULL)
+                ON CONFLICT (user_id) DO UPDATE
+                   SET action_count = donation_prompts.action_count + 1
+                RETURNING action_count, last_shown_at, times_shown
+            )
+            SELECT b.action_count, b.last_shown_at, b.times_shown,
+                   EXISTS (SELECT 1 FROM star_transactions t
+                            WHERE t.user_id = %(uid)s AND t.status = 'paid')
+            FROM bumped b
             """,
-            (user_id,),
+            {"uid": user_id},
         )
         row = cur.fetchone()
         conn.commit()
-        return row[0], row[1]
+        return row[0], row[1], row[2] or 0, bool(row[3])
 
 
 def reset_donation_prompt(user_id: int) -> None:
-    """Zeroes the action counter and stamps 'last_shown_at' -- call right
-    after actually showing the nudge, not on every check."""
+    """Zeroes the action counter, stamps 'last_shown_at' and counts the
+    showing -- call right after actually showing the nudge, not on every
+    check."""
     now = datetime.now(timezone.utc).isoformat()
     with pooled() as conn:
         conn.execute(
             """
-            INSERT INTO donation_prompts (user_id, action_count, last_shown_at)
-            VALUES (%s, 0, %s)
-            ON CONFLICT (user_id) DO UPDATE SET action_count = 0, last_shown_at = excluded.last_shown_at
+            INSERT INTO donation_prompts (user_id, action_count, last_shown_at, times_shown)
+            VALUES (%s, 0, %s, 1)
+            ON CONFLICT (user_id) DO UPDATE SET
+                action_count = 0,
+                last_shown_at = excluded.last_shown_at,
+                times_shown = donation_prompts.times_shown + 1
             """,
             (user_id, now),
         )
         conn.commit()
 
+
+def get_pinned_donation_message(user_id: int) -> int | None:
+    """The id of the nudge this bot pinned in that person's chat, if any."""
+    with pooled_read() as conn:
+        cur = conn.execute(
+            "SELECT pinned_message_id FROM donation_prompts WHERE user_id = %s", (user_id,)
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def set_pinned_donation_message(user_id: int, message_id: int | None) -> None:
+    with pooled() as conn:
+        conn.execute(
+            """
+            INSERT INTO donation_prompts (user_id, action_count, pinned_message_id)
+            VALUES (%s, 0, %s)
+            ON CONFLICT (user_id) DO UPDATE SET pinned_message_id = excluded.pinned_message_id
+            """,
+            (user_id, message_id),
+        )
+        conn.commit()
+
+
+
+# ---------- how much of the day one person may have ----------
+# This is the one bot in the family whose work costs real money and real
+# time: a fetch out to a site that would rather not be fetched from, an
+# ffmpeg mux, and an upload back through Telegram. MAX_CONCURRENT_DOWNLOADS
+# caps how many run at once, which protects the container -- but two slots
+# shared by everybody is not the same thing as a fair share of them, and one
+# person pasting a playlist of links holds both for as long as they keep
+# pasting. Everyone else waits behind them, and the bot looks broken to
+# people who did nothing wrong.
+#
+# So: a rolling hour and a rolling day, per person, counted in the database.
+# The numbers are set where somebody using the bot the way it is meant to be
+# used never meets them -- the ceiling is for the loop, not for the
+# enthusiast -- and they are rolling windows rather than a reset at midnight,
+# because a reset at midnight is an invitation to queue up against it.
+#
+# Donors get a larger share. Not a different bot and not a queue-jump: the
+# same bot with the ceiling moved, which is the honest version of paying for
+# something whose cost is a fetch and an encode. A single donation of any
+# size counts, forever -- billing anybody monthly for this would cost more to
+# run than it collects.
+
+DOWNLOADS_PER_HOUR = int(os.environ.get("DBOT_DOWNLOADS_PER_HOUR", "12"))
+DOWNLOADS_PER_DAY = int(os.environ.get("DBOT_DOWNLOADS_PER_DAY", "40"))
+DONOR_MULTIPLIER = float(os.environ.get("DBOT_DONOR_MULTIPLIER", "4"))
+DOWNLOAD_RETENTION_DAYS = int(os.environ.get("DBOT_DOWNLOAD_RETENTION_DAYS", "7"))
+
+
+def download_allowance(user_id: int) -> dict:
+    """What this person has left, and when the next one frees up.
+
+    One query for all of it: how many downloads in the last hour, how many in
+    the last day, when the oldest of each window falls out, and whether this
+    person has ever donated. Called once per link, on a database that is a
+    long way from the container, so it is one round trip rather than four.
+
+    Returns a dict with:
+      allowed    -- may they start one now
+      scope      -- "hour" or "day", which ceiling stopped them
+      wait_min   -- whole minutes until the next one frees up
+      hour/day   -- how many they have used
+      hour_max/day_max -- their ceilings, donor multiplier already applied
+      donor      -- whether the larger ceiling is in force
+    """
+    with pooled_read() as conn:
+        cur = conn.execute(
+            """
+            SELECT
+              count(*) FILTER (WHERE occurred_at > now() - interval '1 hour'),
+              count(*) FILTER (WHERE occurred_at > now() - interval '1 day'),
+              min(occurred_at) FILTER (WHERE occurred_at > now() - interval '1 hour'),
+              min(occurred_at) FILTER (WHERE occurred_at > now() - interval '1 day'),
+              EXISTS (SELECT 1 FROM star_transactions t
+                       WHERE t.user_id = %(uid)s AND t.status = 'paid')
+            FROM download_events WHERE user_id = %(uid)s
+            """,
+            {"uid": user_id},
+        )
+        used_hour, used_day, oldest_hour, oldest_day, donor = cur.fetchone()
+
+    factor = DONOR_MULTIPLIER if donor else 1
+    hour_max = int(DOWNLOADS_PER_HOUR * factor) if DOWNLOADS_PER_HOUR > 0 else 0
+    day_max = int(DOWNLOADS_PER_DAY * factor) if DOWNLOADS_PER_DAY > 0 else 0
+    state = {
+        "hour": used_hour or 0, "day": used_day or 0,
+        "hour_max": hour_max, "day_max": day_max,
+        "donor": bool(donor), "allowed": True, "scope": None, "wait_min": 0,
+    }
+
+    def _minutes_until(oldest, seconds: int) -> int:
+        if oldest is None:
+            return 1
+        gone = (datetime.now(timezone.utc) - oldest).total_seconds()
+        return max(1, int((seconds - gone) // 60) + 1)
+
+    # The day is checked first: being told "about 40 minutes" when the real
+    # answer is nine hours is worse than not being told at all.
+    if day_max and state["day"] >= day_max:
+        state.update(allowed=False, scope="day",
+                     wait_min=_minutes_until(oldest_day, 86400))
+    elif hour_max and state["hour"] >= hour_max:
+        state.update(allowed=False, scope="hour",
+                     wait_min=_minutes_until(oldest_hour, 3600))
+    return state
+
+
+def record_download(user_id: int, platform: str | None = None) -> None:
+    """Counted when a download is STARTED, not when it succeeds. A fetch that
+    fails still cost the fetch, and counting only successes would make a
+    string of failures free -- which is the cheapest way to keep the bot
+    busy."""
+    with pooled() as conn:
+        conn.execute(
+            "INSERT INTO download_events (user_id, platform) VALUES (%s, %s)",
+            (user_id, platform),
+        )
+        conn.commit()
 
 # ---------- housekeeping ----------
 # activity_events is append-only and powers nothing older than the retention
@@ -599,6 +787,14 @@ def prune_old_data() -> int:
             (ACTIVITY_RETENTION_DAYS,),
         )
         removed = cur.rowcount
+        # The quota only ever looks back a day; anything older is history
+        # nobody reads. Kept a week so the owner can still answer "was that
+        # person really hammering it on Tuesday".
+        cur = conn.execute(
+            "DELETE FROM download_events WHERE occurred_at < now() - make_interval(days => %s)",
+            (DOWNLOAD_RETENTION_DAYS,),
+        )
+        removed += cur.rowcount
         conn.commit()
     return removed
 

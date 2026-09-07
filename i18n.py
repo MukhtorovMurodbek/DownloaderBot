@@ -38,19 +38,19 @@ STRINGS = {
     "en": {
         "quota_hour": (
             "You've had {used} downloads in the last hour, which is this bot's limit "
-            "({limit}/hour) -- it's there so everyone gets a turn on a small server. "
+            "({limit}/hour) — it's there so everyone gets a turn on a small server. "
             "The next one frees up in about {minutes} minute(s)."
         ),
         "quota_day": (
             "You've had {used} downloads today, which is this bot's daily limit "
-            "({limit}) -- it's there so everyone gets a turn on a small server. "
+            "({limit}) — it's there so everyone gets a turn on a small server. "
             "It frees up again in about {minutes} minute(s)."
         ),
         "quota_donor_hint": (
             "If you need more: anyone who has ever chipped in via /donate gets a much "
             "higher limit, permanently. One donation of any size is enough."
         ),
-        "flood_wait": "You're going faster than I can keep up with -- give it about {seconds} second(s) and carry on.",
+        "flood_wait": "You're going faster than I can keep up with — give it about {seconds} second(s) and carry on.",
         # ---- shared keys (same name in every bot's i18n.py) ----
         "sibling_blurb": "Also part of this bot family, see below \U0001f447",
         "donation_nudge": (
@@ -58,11 +58,11 @@ STRINGS = {
             "running it, and /donate is a totally optional way to help keep it alive. "
             "No pressure either way!"
         ),
-        "donate_unknown_currency": 'Unknown currency "{currency}" -- try xtr or usd.',
-        "donate_currency_not_configured": "{currency} donations aren't set up on this bot yet -- try Stars instead.",
-        "donate_invalid_amount": "That's not a valid amount -- try e.g. /donate 500 or /donate 5 usd.",
+        "donate_unknown_currency": 'Unknown currency "{currency}" — try xtr or usd.',
+        "donate_currency_not_configured": "{currency} donations aren't set up on this bot yet — try Stars instead.",
+        "donate_invalid_amount": "That's not a valid amount — try e.g. /donate 500 or /donate 5 usd.",
         "donate_prompt": (
-            "Thank you for contributing -- it goes directly toward this bot's "
+            "Thank you for contributing — it goes directly toward this bot's "
             "hosting and API costs. Choose an amount below, or Custom to enter "
             "your own (you can also send /donate <number> [usd] directly)."
         ),
@@ -75,13 +75,113 @@ STRINGS = {
         "donate_invoice_error": "⚠️ Telegram wouldn't create that invoice: {error}",
         "stars_unit": "Stars",
         "donate_custom_ask": "How many {unit} would you like to donate? Reply with a number.",
-        "donate_invalid_amount_retry": "That's not a valid amount -- send /donate to try again.",
+        "donate_invalid_amount_retry": "That's not a valid amount — send /donate to try again.",
         "donate_thanks": "🙏 Thank you for the {amount} ⭐ — genuinely appreciated!",
+        "bot_short_description": (
+            "Paste a public Instagram, TikTok, Pinterest, Reddit or X link."
+        ),
+        "bot_description": (
+            "Paste a link to a public post and the media comes back. No command needed.\n"
+            "\n"
+            "Instagram, TikTok, Pinterest, Reddit and X. Carousels arrive whole, and a text post "
+            "comes back as a rendered card.\n"
+            "\n"
+            "It fetches what is already public — it is not a way around a private account. "
+            "English, Uzbek and Russian. /privacy says what it keeps."
+        ),
+        # ---- shared policy keys (/privacy, /terms, /deletemydata) ----
+        "privacy_heading": "🔒 Privacy",
+        "privacy_kept_heading": "What this bot keeps:",
+        "privacy_stored": (
+            "• your Telegram user id, your language, and your caption and quality settings\n"
+            "• the link you send, for as long as it takes to fetch what is behind it\n"
+            "• one row per download — which platform and when, which is what the daily allowance "
+            "counts\n"
+            "• a timestamp each time you use the bot, so its owner can tell whether anyone is "
+            "using it\n"
+            "• a record of any donation: the amount and Telegram's payment id\n"
+            "• whatever the bot is in the middle of doing with you, until it is finished\n"
+            "\n"
+            "The media itself is not kept. It is fetched, sent to you, and deleted."
+        ),
+        "privacy_seen_by_heading": "Who else sees it:",
+        "privacy_seen_by": (
+            "• Telegram, which carries every message both ways and sets its own terms\n"
+            "• the hosting provider this bot runs on, and the database it writes to"
+        ),
+        "privacy_others": (
+            "• the site you linked to, and the download services this bot falls back on when a "
+            "site will not answer it directly. They get the link and see a request from this "
+            "bot's server rather than from you; what they log is their business, under their own "
+            "policies and not this one."
+        ),
+        "privacy_kept_for_heading": "How long it stays:",
+        "privacy_kept_for": (
+            "Settings and anything the bot is holding for you stay until you erase them or stop "
+            "using it. Counted use is dropped after about three months. Payment records are kept "
+            "longer, because refunds are issued against them.\n"
+            "\n"
+            "Nothing here is sold, rented or used for advertising, and nothing goes to anyone not "
+            "named above."
+        ),
+        "privacy_your_choices": (
+            "What you can do:\n"
+            "/deletemydata — erase what this bot holds on you\n"
+            "/terms — what the bot may be used for\n"
+            "\n"
+            "Blocking the bot in Telegram stops it talking to you but erases nothing, so send "
+            "/deletemydata first if you want both."
+        ),
+        "terms_heading": "📜 Terms",
+        "terms_use": (
+            "Use it for what it is for, within the law and within Telegram's own terms. Do not "
+            "use it to harass anyone, and do not drive it past the limits it sets — an account "
+            "doing either is blocked."
+        ),
+        "terms_specific": (
+            "Downloads: this fetches what is already public and hands it to you. It is not a way "
+            "around a private account and does not try to be one. What you do afterwards with "
+            "someone else's photo, video or post is between you, them and the law — downloading "
+            "something does not make it yours. There is a daily allowance per person, so that one "
+            "person cannot make the bot unusable for everybody else."
+        ),
+        "terms_money": (
+            "Money: /donate is voluntary and buys nothing at all — it goes towards what the bot "
+            "costs to run. Telegram handles every payment and the bot never sees a card number. "
+            "Send one by mistake and it comes back if you ask."
+        ),
+        "terms_no_warranty": (
+            "No promises: one person runs this, it is free, and it can be slow, wrong, or off "
+            "entirely without warning. Keep your own copy of anything that matters."
+        ),
+        "policy_full_text": "Full text: {url}",
+        "policy_contact": "Questions, complaints or a data request: {contact}",
+        "delete_data_confirm": "⚠️ This erases what this bot holds on you. There is no undo.",
+        "delete_data_consequences": (
+            "Your language, your caption and quality settings, and every record of what you "
+            "downloaded and when all go. Your daily allowance resets with them. Nothing you "
+            "downloaded is affected — it was never kept here.\n"
+            "\n"
+            "Donation records stay, without your username, because refunds are issued against "
+            "them."
+        ),
+        "delete_data_button_yes": "🗑 Erase it",
+        "delete_data_button_no": "↩️ Keep my data",
+        "delete_data_kept": "Nothing was erased.",
+        "delete_data_done": (
+            "🗑 Done — {rows} record(s) erased.\n"
+            "\n"
+            "Send /start whenever you like; the bot will treat you as new."
+        ),
+        "delete_data_failed": (
+            "Couldn't erase that just now — something went wrong at my end. Please try again in "
+            "a few minutes."
+        ),
         "language_set_confirmation": "✅ Language set to English.",
         "cancel_header": "\u274c Cancelled:",
-        "cancel_nothing": "Nothing to cancel -- I wasn't waiting on anything from you.",
+        "cancel_nothing": "Nothing to cancel — I wasn't waiting on anything from you.",
         "cancel_ask": "What should I stop? Here's what I'm waiting on:",
-        "cancel_kept": "Alright -- nothing cancelled.",
+        "cancel_kept": "Alright — nothing cancelled.",
         "cancel_reply_box_freed": "Your reply box is free again.",
         "cancel_button_all": "❌ All of it",
         "cancel_button_none": "↩️ Nothing, keep going",
@@ -94,7 +194,7 @@ STRINGS = {
             "Twitter/X) and I'll grab it for you.\n\n"
         ),
         "help_text": (
-            "Paste a link any time and I'll grab it -- no command needed:\n"
+            "Paste a link any time and I'll grab it — no command needed:\n"
             "  - Instagram: reels, photos, whole carousels\n"
             "  - TikTok: videos without the watermark, and photo slideshows\n"
             "  - Twitter/X: video and photos, or a clean image card for a text post\n"
@@ -106,8 +206,6 @@ STRINGS = {
             "/donate - chip in for hosting costs (totally optional)\n"
             "/cancel - stop something I'm waiting on you for (I'll ask which)\n"
             "/en, /uz, /rus - switch language (or /language, which asks)\n\n"
-            "This bot is still being developed and hosted temporarily -- if it's not "
-            "responding, it should come back the next time I'm running it.\n\n"
         ),
         "caption_state_on": "ON",
         "caption_state_off": "OFF",
@@ -116,7 +214,7 @@ STRINGS = {
         "caption_toggle_answer": "Caption turned {state}.",
         "lossless_state_on": "ON",
         "lossless_state_off": "OFF",
-        "lossless_status": "Lossless is currently {state}.\n\nON: downloads arrive as files, exactly as the source had them -- no Telegram re-compression, but they don't play or preview in the chat until you open them.\nOFF: downloads arrive as photos and videos that play inline, compressed by Telegram.",
+        "lossless_status": "Lossless is currently {state}.\n\nON: downloads arrive as files, exactly as the source had them — no Telegram re-compression, but they don't play or preview in the chat until you open them.\nOFF: downloads arrive as photos and videos that play inline, compressed by Telegram.",
         "lossless_turned": "Lossless downloads turned {state}.",
         "lossless_toggle_answer": "Lossless turned {state}.",
         "download_credit_caption": "⬇️ via @{username}",
@@ -134,22 +232,22 @@ STRINGS = {
         "download_all_routes_failed": "😕 That one didn't work, and I tried every way I know. Give it a minute and send it again — if it keeps failing, it is the site, not the link.",
         "fetching": "Fetching...",
         "reddit_fetch_failed": "Couldn't fetch that Reddit post: {error}",
-        "twitter_fetch_failed_link": "Couldn't fetch that post's content right now -- here's the link: {url}",
+        "twitter_fetch_failed_link": "Couldn't fetch that post's content right now — here's the link: {url}",
         "unrecognized_message": (
-            "That doesn't look like a link I recognize -- Instagram, TikTok, "
-            "Pinterest, Reddit, or Twitter/X -- paste one to download it, or "
+            "That doesn't look like a link I recognize — Instagram, TikTok, "
+            "Pinterest, Reddit, or Twitter/X — paste one to download it, or "
             "/help for commands."
         ),
         "unknown_command": "I don't recognize that command. Send /help to see what I can do.",
     },
     "uz": {
         "quota_hour": (
-            "Oxirgi bir soatda {used} ta yuklab oldingiz -- bu botning chegarasi "
+            "Oxirgi bir soatda {used} ta yuklab oldingiz — bu botning chegarasi "
             "(soatiga {limit}). Kichik serverda hammaga navbat yetishi uchun shunday. "
             "Keyingisi taxminan {minutes} daqiqadan keyin bo'shaydi."
         ),
         "quota_day": (
-            "Bugun {used} ta yuklab oldingiz -- bu botning kunlik chegarasi ({limit}). "
+            "Bugun {used} ta yuklab oldingiz — bu botning kunlik chegarasi ({limit}). "
             "Kichik serverda hammaga navbat yetishi uchun shunday. Taxminan {minutes} "
             "daqiqadan keyin yana ochiladi."
         ),
@@ -157,7 +255,7 @@ STRINGS = {
             "Ko'proq kerak bo'lsa: /donate orqali biror marta yordam bergan har kimga "
             "chegara doimiy ravishda ancha yuqori qilib qo'yiladi. Miqdori muhim emas."
         ),
-        "flood_wait": "Siz men ulgurganimdan tezroq yuboryapsiz -- taxminan {seconds} soniya kutib, davom eting.",
+        "flood_wait": "Siz men ulgurganimdan tezroq yuboryapsiz — taxminan {seconds} soniya kutib, davom eting.",
         "sibling_blurb": "Bu bot oilasining bir qismi, pastda ko'ring \U0001f447",
         "donation_nudge": (
             "💙 Agar bu bot foydali bo'lgan bo'lsa: hosting/API xarajatlarini uni ishga "
@@ -184,11 +282,116 @@ STRINGS = {
         "donate_custom_ask": "Nechta {unit} xayriya qilmoqchisiz? Raqam bilan javob bering.",
         "donate_invalid_amount_retry": "Bu noto'g'ri miqdor — qayta urinish uchun /donate yuboring.",
         "donate_thanks": "🙏 {amount} ⭐ uchun rahmat — bu chindan ham qadrlanadi!",
+        "bot_short_description": (
+            "Instagram, TikTok, Pinterest, Reddit yoki X havolasini tashlang."
+        ),
+        "bot_description": (
+            "Ochiq postning havolasini tashlang — fayl qaytib keladi. Buyruq shart emas.\n"
+            "\n"
+            "Instagram, TikTok, Pinterest, Reddit va X. Karusel to'liq keladi, matnli post esa "
+            "chiroyli kartochka bo'lib qaytadi.\n"
+            "\n"
+            "U allaqachon ochiq bo'lgan narsani oladi — yopiq akkauntni aylanib o'tish yo'li "
+            "emas. Ingliz, o'zbek va rus tillarida. /privacy — nima saqlanadi."
+        ),
+        # ---- shared policy keys (/privacy, /terms, /deletemydata) ----
+        "privacy_heading": "🔒 Maxfiylik",
+        "privacy_kept_heading": "Bu bot nimalarni saqlaydi:",
+        "privacy_stored": (
+            "• Telegram foydalanuvchi raqamingiz, tilingiz, izoh va sifat sozlamalaringiz\n"
+            "• yuborgan havolangiz — ortidagi narsa olinguncha\n"
+            "• har bir yuklab olish uchun bitta yozuv: qaysi platforma va qachon; kunlik cheklov "
+            "shuni sanaydi\n"
+            "• botdan har foydalanganingizda vaqt belgisi — egasi umuman kimdir "
+            "foydalanayotganini bilishi uchun\n"
+            "• xayriya qilsangiz, uning yozuvi: miqdori va Telegramning to'lov raqami\n"
+            "• bot siz bilan boshlagan ish tugagunicha uning holati\n"
+            "\n"
+            "Faylning o'zi saqlanmaydi: olinadi, sizga yuboriladi va o'chiriladi."
+        ),
+        "privacy_seen_by_heading": "Yana kim ko'radi:",
+        "privacy_seen_by": (
+            "• Telegram — har bir xabarni ikki tomonga ham u tashiydi va o'z shartlarini o'zi "
+            "belgilaydi\n"
+            "• bot ishlab turgan hosting va u yozadigan ma'lumotlar bazasi"
+        ),
+        "privacy_others": (
+            "• havola bergan saytingiz va sayt to'g'ridan-to'g'ri javob bermaganda bot murojaat "
+            "qiladigan yuklab olish xizmatlari. Ular havolani oladi va so'rovni sizdan emas, "
+            "botning serveridan kelgan deb ko'radi; ular nimani yozib qo'yishi — o'zlarining "
+            "ishi va o'z qoidalariga bo'ysunadi, bunisiga emas."
+        ),
+        "privacy_kept_for_heading": "Qancha vaqt saqlanadi:",
+        "privacy_kept_for": (
+            "Sozlamalar va bot siz uchun ushlab turgan narsalar siz o'chirmaguningizcha yoki "
+            "botdan foydalanishni to'xtatmaguningizcha qoladi. Foydalanish belgilari taxminan uch "
+            "oydan keyin o'chiriladi. To'lov yozuvlari uzoqroq saqlanadi, chunki pulni qaytarish "
+            "o'shalar asosida amalga oshiriladi.\n"
+            "\n"
+            "Bu yerdagi hech narsa sotilmaydi, ijaraga berilmaydi va reklama uchun ishlatilmaydi; "
+            "yuqorida sanab o'tilmagan hech kimga hech narsa berilmaydi."
+        ),
+        "privacy_your_choices": (
+            "Nima qila olasiz:\n"
+            "/deletemydata — bot siz haqingizda saqlaganini o'chirish\n"
+            "/terms — botdan nima uchun foydalanish mumkinligi\n"
+            "\n"
+            "Telegramda botni bloklash uni siz bilan gaplashishdan to'xtatadi, lekin hech narsani "
+            "o'chirmaydi — ikkalasi ham kerak bo'lsa, avval /deletemydata yuboring."
+        ),
+        "terms_heading": "📜 Shartlar",
+        "terms_use": (
+            "Botdan o'z maqsadi bo'yicha, qonun va Telegram shartlari doirasida foydalaning. Uni "
+            "birovni bezovta qilish uchun ishlatmang va u belgilagan cheklovlardan oshirib "
+            "yuklamang — bunday akkaunt bloklanadi."
+        ),
+        "terms_specific": (
+            "Yuklab olish haqida: bot allaqachon ochiq bo'lgan narsani olib beradi. U yopiq "
+            "akkauntni aylanib o'tish yo'li emas va bunga urinmaydi ham. Birovning surati, "
+            "videosi yoki postini keyin nima qilishingiz — siz, o'sha odam va qonun o'rtasidagi "
+            "ish; yuklab olish uni sizniki qilib qo'ymaydi. Har bir kishiga kunlik cheklov bor, "
+            "toki bitta odam botni hammaga yaroqsiz qilib qo'ymasin."
+        ),
+        "terms_money": (
+            "Pul haqida: /donate ixtiyoriy va hech narsa sotib olmaydi — u botni ishlatish "
+            "xarajatlariga ketadi. Har bir to'lovni Telegram amalga oshiradi, bot karta raqamini "
+            "hech qachon ko'rmaydi. Adashib yuborsangiz, aytsangiz qaytariladi."
+        ),
+        "terms_no_warranty": (
+            "Va'da yo'q: buni bir kishi olib boradi, u bepul, va ogohlantirishsiz sekinlashishi, "
+            "xato qilishi yoki umuman o'chib qolishi mumkin. Siz uchun muhim narsaning nusxasini "
+            "o'zingizda saqlang."
+        ),
+        "policy_full_text": "To'liq matn: {url}",
+        "policy_contact": "Savollar, shikoyatlar yoki ma'lumot so'rovi: {contact}",
+        "delete_data_confirm": (
+            "⚠️ Bu bot siz haqingizda saqlagan narsalarni o'chiradi. Ortga qaytarib bo'lmaydi."
+        ),
+        "delete_data_consequences": (
+            "Tilingiz, izoh va sifat sozlamalaringiz hamda nimani qachon yuklaganingiz haqidagi "
+            "barcha yozuvlar o'chadi. Kunlik cheklovingiz ham nolga qaytadi. Yuklab olgan "
+            "narsalaringizga hech narsa bo'lmaydi — ular bu yerda hech qachon saqlanmagan.\n"
+            "\n"
+            "Xayriya yozuvlari foydalanuvchi nomingizsiz qoladi, chunki pulni qaytarish o'shalar "
+            "asosida qilinadi."
+        ),
+        "delete_data_button_yes": "🗑 O'chirilsin",
+        "delete_data_button_no": "↩️ Ma'lumotlarim qolsin",
+        "delete_data_kept": "Hech narsa o'chirilmadi.",
+        "delete_data_done": (
+            "🗑 Bajarildi — {rows} ta yozuv o'chirildi.\n"
+            "\n"
+            "Istalgan payt /start yuboring; bot sizni yangi foydalanuvchi sifatida qabul qiladi."
+        ),
+        "delete_data_failed": (
+            "Hozir o'chira olmadim — mening tomonimda nimadir noto'g'ri ketdi. Bir necha "
+            "daqiqadan keyin qayta urinib ko'ring."
+        ),
         "language_set_confirmation": "✅ Til o'zbekchaga o'zgartirildi.",
         "cancel_header": "\u274c Bekor qilindi:",
-        "cancel_nothing": "Bekor qiladigan narsa yo'q -- men sizdan hech narsa kutmayotgan edim.",
+        "cancel_nothing": "Bekor qiladigan narsa yo'q — men sizdan hech narsa kutmayotgan edim.",
         "cancel_ask": "Nimani to'xtatay? Mana, men nimalarni kutyapman:",
-        "cancel_kept": "Yaxshi -- hech narsa bekor qilinmadi.",
+        "cancel_kept": "Yaxshi — hech narsa bekor qilinmadi.",
         "cancel_reply_box_freed": "Javob yozish oynasi yana bo'sh.",
         "cancel_button_all": "❌ Hammasini",
         "cancel_button_none": "↩️ Hech narsani, davom etamiz",
@@ -212,8 +415,6 @@ STRINGS = {
             "/donate - hosting xarajatlariga hissa qo'shish (ixtiyoriy)\n"
             "/cancel - men sizdan kutayotgan ishni to'xtatish (qaysinisini so'rayman)\n"
             "/en, /uz, /rus - tilni almashtirish (yoki /language — u so\'raydi)\n\n"
-            "Bu bot hali ishlab chiqilmoqda va vaqtinchalik joylashtirilgan — agar "
-            "javob bermasa, keyingi safar ishga tushirilganda qaytadi.\n\n"
         ),
         "caption_state_on": "YONIQ",
         "caption_state_off": "O'CHIQ",
@@ -222,7 +423,7 @@ STRINGS = {
         "caption_toggle_answer": "Izoh {state} qilindi.",
         "lossless_state_on": "YONIQ",
         "lossless_state_off": "O'CHIQ",
-        "lossless_status": "Yo'qotishsiz rejim hozir {state}.\n\nYONIQ: yuklamalar fayl sifatida keladi, manbadagidek aynan -- Telegram siqmaydi, lekin ochmaguningizcha chatda ko'rinmaydi va ijro etilmaydi.\nO'CHIQ: yuklamalar chatda darhol ijro etiladigan rasm va video sifatida, Telegram siqishi bilan keladi.",
+        "lossless_status": "Yo'qotishsiz rejim hozir {state}.\n\nYONIQ: yuklamalar fayl sifatida keladi, manbadagidek aynan — Telegram siqmaydi, lekin ochmaguningizcha chatda ko'rinmaydi va ijro etilmaydi.\nO'CHIQ: yuklamalar chatda darhol ijro etiladigan rasm va video sifatida, Telegram siqishi bilan keladi.",
         "lossless_turned": "Yo'qotishsiz yuklash {state} qilindi.",
         "lossless_toggle_answer": "Yo'qotishsiz rejim {state} qilindi.",
         "download_credit_caption": "⬇️ @{username} orqali",
@@ -263,7 +464,7 @@ STRINGS = {
             "Если нужно больше: у всех, кто хоть раз поддержал бота через /donate, "
             "предел заметно выше и навсегда. Сумма значения не имеет."
         ),
-        "flood_wait": "Ты отправляешь быстрее, чем я успеваю -- подожди примерно {seconds} секунд(ы) и продолжай.",
+        "flood_wait": "Ты отправляешь быстрее, чем я успеваю — подожди примерно {seconds} секунд(ы) и продолжай.",
         "sibling_blurb": "Тоже часть этой семьи ботов, смотри ниже \U0001f447",
         "donation_nudge": (
             "💙 Если этот бот оказался полезным: расходы на хостинг/API покрывает тот, "
@@ -289,11 +490,110 @@ STRINGS = {
         "donate_custom_ask": "Сколько {unit} вы хотите пожертвовать? Ответьте числом.",
         "donate_invalid_amount_retry": "Это некорректная сумма — отправьте /donate, чтобы попробовать снова.",
         "donate_thanks": "🙏 Спасибо за {amount} ⭐ — это по-настоящему ценно!",
+        "bot_short_description": (
+            "Пришли ссылку на пост в Instagram, TikTok, Pinterest, Reddit или X."
+        ),
+        "bot_description": (
+            "Пришли ссылку на открытый пост — вернётся сам файл. Команда не нужна.\n"
+            "\n"
+            "Instagram, TikTok, Pinterest, Reddit и X. Карусель приходит целиком, а текстовый "
+            "пост возвращается аккуратной карточкой.\n"
+            "\n"
+            "Бот достаёт то, что и так открыто, — это не обход закрытого аккаунта. Английский, "
+            "узбекский и русский. /privacy — что бот хранит."
+        ),
+        # ---- shared policy keys (/privacy, /terms, /deletemydata) ----
+        "privacy_heading": "🔒 Конфиденциальность",
+        "privacy_kept_heading": "Что бот хранит:",
+        "privacy_stored": (
+            "• твой числовой id в Telegram, язык и настройки подписи и качества\n"
+            "• присланную ссылку — на то время, пока бот достаёт то, что за ней\n"
+            "• по одной записи на скачивание: с какой площадки и когда — по ним считается "
+            "дневной лимит\n"
+            "• отметку времени на каждое обращение к боту — чтобы владелец видел, пользуется ли "
+            "ботом хоть кто-нибудь\n"
+            "• запись о пожертвовании: сумму и платёжный id Telegram\n"
+            "• то, что бот в этот момент для тебя делает — пока не закончит\n"
+            "\n"
+            "Само видео или фото не хранится: бот его достаёт, отправляет тебе и удаляет."
+        ),
+        "privacy_seen_by_heading": "Кто ещё это видит:",
+        "privacy_seen_by": (
+            "• Telegram — он передаёт каждое сообщение в обе стороны и действует по своим "
+            "правилам\n"
+            "• хостинг, на котором работает бот, и база данных, в которую он пишет"
+        ),
+        "privacy_others": (
+            "• сайт, на который ведёт ссылка, и сервисы скачивания, к которым бот обращается, "
+            "когда сайт не отвечает ему напрямую. Они получают ссылку и видят запрос с сервера "
+            "бота, а не от тебя; что они у себя пишут в логи — их дело и их правила, а не эти."
+        ),
+        "privacy_kept_for_heading": "Сколько это хранится:",
+        "privacy_kept_for": (
+            "Настройки и всё, что бот держит для тебя, остаются, пока ты их не сотрёшь или не "
+            "перестанешь пользоваться ботом. Отметки об использовании удаляются примерно через "
+            "три месяца. Записи о платежах хранятся дольше — по ним делается возврат.\n"
+            "\n"
+            "Ничего из этого не продаётся, не сдаётся в аренду и не используется для рекламы, и "
+            "никому кроме перечисленных выше не передаётся."
+        ),
+        "privacy_your_choices": (
+            "Что можно сделать:\n"
+            "/deletemydata — стереть всё, что бот хранит о тебе\n"
+            "/terms — для чего ботом можно пользоваться\n"
+            "\n"
+            "Блокировка бота в Telegram остановит его сообщения, но ничего не сотрёт — если "
+            "нужно и то и другое, сначала отправь /deletemydata."
+        ),
+        "terms_heading": "📜 Условия",
+        "terms_use": (
+            "Пользуйся ботом по назначению, в рамках закона и правил самого Telegram. Не "
+            "используй его, чтобы кого-то донимать, и не нагружай сверх заданных лимитов — за то "
+            "и другое аккаунт блокируется."
+        ),
+        "terms_specific": (
+            "О скачивании: бот достаёт то, что и так открыто, и отдаёт тебе. Это не обход "
+            "закрытого аккаунта, и он даже не пытается им быть. Что ты потом сделаешь с чужим "
+            "фото, видео или постом — это между тобой, автором и законом: скачать не значит "
+            "присвоить. На каждого есть дневной лимит, чтобы один человек не сделал бота "
+            "бесполезным для всех остальных."
+        ),
+        "terms_money": (
+            "О деньгах: /donate — дело добровольное и ничего не покупает: деньги идут на то, во "
+            "что бот обходится. Все платежи проводит Telegram, бот никогда не видит номер карты. "
+            "Отправил по ошибке — скажи, и вернём."
+        ),
+        "terms_no_warranty": (
+            "Без обещаний: бота ведёт один человек, он бесплатный и может тормозить, ошибаться "
+            "или вовсе не работать без предупреждения. Держи свою копию всего, что тебе важно."
+        ),
+        "policy_full_text": "Полный текст: {url}",
+        "policy_contact": "Вопросы, жалобы или запрос по данным: {contact}",
+        "delete_data_confirm": "⚠️ Это сотрёт всё, что бот хранит о тебе. Отменить будет нельзя.",
+        "delete_data_consequences": (
+            "Язык, настройки подписи и качества и все записи о том, что и когда ты скачивал, "
+            "будут стёрты. Дневной лимит вместе с ними обнулится. На уже скачанное это никак не "
+            "влияет — здесь оно и не хранилось.\n"
+            "\n"
+            "Записи о пожертвованиях останутся, без username, потому что по ним делается возврат."
+        ),
+        "delete_data_button_yes": "🗑 Стереть",
+        "delete_data_button_no": "↩️ Оставить мои данные",
+        "delete_data_kept": "Ничего не стёрто.",
+        "delete_data_done": (
+            "🗑 Готово — стёрто записей: {rows}.\n"
+            "\n"
+            "Отправь /start когда захочешь; бот примет тебя как нового."
+        ),
+        "delete_data_failed": (
+            "Сейчас стереть не получилось — что-то сломалось на моей стороне. Попробуй ещё раз "
+            "через несколько минут."
+        ),
         "language_set_confirmation": "✅ Язык изменён на русский.",
         "cancel_header": "\u274c \u041e\u0442\u043c\u0435\u043d\u0435\u043d\u043e:",
-        "cancel_nothing": "\u041e\u0442\u043c\u0435\u043d\u044f\u0442\u044c \u043d\u0435\u0447\u0435\u0433\u043e -- \u044f \u043d\u0438\u0447\u0435\u0433\u043e \u043e\u0442 \u0432\u0430\u0441 \u043d\u0435 \u0436\u0434\u0430\u043b.",
+        "cancel_nothing": "\u041e\u0442\u043c\u0435\u043d\u044f\u0442\u044c \u043d\u0435\u0447\u0435\u0433\u043e — \u044f \u043d\u0438\u0447\u0435\u0433\u043e \u043e\u0442 \u0432\u0430\u0441 \u043d\u0435 \u0436\u0434\u0430\u043b.",
         "cancel_ask": "Что остановить? Вот что я жду:",
-        "cancel_kept": "Хорошо -- ничего не отменено.",
+        "cancel_kept": "Хорошо — ничего не отменено.",
         "cancel_reply_box_freed": "Поле ответа снова свободно.",
         "cancel_button_all": "❌ Всё",
         "cancel_button_none": "↩️ Ничего, продолжаем",
@@ -317,8 +617,6 @@ STRINGS = {
             "/donate - помочь с расходами на хостинг (совершенно необязательно)\n"
             "/cancel - остановить то, чего я от вас жду (спрошу, что именно)\n"
             "/en, /uz, /rus - сменить язык (или /language — он спрашивает)\n\n"
-            "Этот бот всё ещё находится в разработке и размещён временно — если он не "
-            "отвечает, он должен вернуться в следующий раз, когда я его запущу.\n\n"
         ),
         "caption_state_on": "ВКЛ",
         "caption_state_off": "ВЫКЛ",
@@ -327,7 +625,7 @@ STRINGS = {
         "caption_toggle_answer": "Подпись теперь {state}.",
         "lossless_state_on": "ВКЛ",
         "lossless_state_off": "ВЫКЛ",
-        "lossless_status": "Режим без потерь сейчас {state}.\n\nВКЛ: загрузки приходят файлом, ровно такими, какими были в источнике -- Telegram их не пережимает, но они не проигрываются в чате, пока вы их не откроете.\nВЫКЛ: загрузки приходят фото и видео, которые играют прямо в чате, со сжатием Telegram.",
+        "lossless_status": "Режим без потерь сейчас {state}.\n\nВКЛ: загрузки приходят файлом, ровно такими, какими были в источнике — Telegram их не пережимает, но они не проигрываются в чате, пока вы их не откроете.\nВЫКЛ: загрузки приходят фото и видео, которые играют прямо в чате, со сжатием Telegram.",
         "lossless_turned": "Загрузка без потерь теперь {state}.",
         "lossless_toggle_answer": "Режим без потерь теперь {state}.",
         "download_credit_caption": "⬇️ через @{username}",

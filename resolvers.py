@@ -272,8 +272,26 @@ async def _get(url: str, *, crawler: bool = False, **kwargs) -> httpx.Response:
 
 
 def _ext_of(name: str, default: str) -> str:
-    _, _, ext = name.rpartition(".")
-    return ext.lower() if ext and len(ext) <= 5 else default
+    """The extension to give a downloaded file, or `default`.
+
+    The name this reads is not ours and is not the user's either: it comes
+    out of whatever a resolver service or a remote URL said the file was
+    called. It ends up in `os.path.join(work_dir, f"{uuid}.{ext}")`, where a
+    "/" is a directory separator and ".." is a level up -- so anything that
+    is not plainly an extension is refused rather than trimmed. The length
+    cap was already doing most of this by accident; being explicit about it
+    is what makes it a rule instead of a coincidence.
+    """
+    _, dot, ext = name.rpartition(".")
+    # rpartition puts the WHOLE string in the third slot when the separator is
+    # absent, so a dotless "video" used to come back as the extension "video".
+    # That reached _kind_of, which then found "video" in neither the video nor
+    # the audio list and called it a photo -- and a clip sent as a photo is a
+    # Telegram error, not a slightly wrong label.
+    if not dot:
+        return default
+    ext = ext.lower()
+    return ext if ext and len(ext) <= 5 and ext.isalnum() and ext.isascii() else default
 
 
 def _kind_of(name: str) -> str:

@@ -798,6 +798,43 @@ def prune_old_data() -> int:
         conn.commit()
     return removed
 
+# ---------- erasing one person, on request ----------
+# What /deletemydata reaches -- see shared_features.py, which owns the
+# command and the confirmation. Everything in this schema that is about one
+# person goes, in a single transaction, with one deliberate exception.
+#
+# The Stars ledger keeps its rows. A donation is a payment, and a payment
+# record has to outlive the payer asking to be forgotten: it is what a refund
+# is issued against and what the totals are counted from. The username is
+# cleared, since it is the one free-text identifier on the row; the numeric
+# id stays, because without it a refund cannot be sent to anybody. The
+# privacy notice says so rather than implying the erase is total.
+
+def erase_user(user_id: int) -> int:
+    """Returns how many rows were removed. Blocking; call through
+    asyncio.to_thread.
+
+    download_events goes with the rest. It is the daily allowance's memory,
+    so erasing it hands this person a fresh allowance -- which is the right
+    trade: a per-user counter that survives the user asking to be forgotten
+    is a record of their behaviour, and the allowance exists to stop one
+    person costing the bot a fortune in a day, not to punish anybody across
+    weeks.
+    """
+    removed = 0
+    with pooled() as conn:
+        for table in ("settings", "donation_prompts", "activity_events", "download_events"):
+            cur = conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
+            removed += cur.rowcount or 0
+        conn.execute(
+            "UPDATE star_transactions SET username = NULL "
+            "WHERE user_id = %s AND username IS NOT NULL",
+            (user_id,),
+        )
+        conn.commit()
+    return removed
+
+
 # ---------- admin: full database export ----------
 
 def dump_database_csv_zip() -> bytes:

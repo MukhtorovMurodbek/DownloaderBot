@@ -1,3 +1,5 @@
+<img src="logo.svg" alt="DownloaderBot" width="72" align="right">
+
 # DownloaderBot
 
 A Telegram bot that downloads media from a pasted link and sends it back. No
@@ -64,10 +66,28 @@ happened, which answers "is it broken, or was that one post private".
 | `/start` | Instructions. The first `/start` from a new user asks which language to use, once. |
 | `/language`, `/en`, `/uz`, `/rus` | Switch language. Each reprints the instructions in the language chosen. |
 | `/help` | The instructions on their own. |
+| `/privacy` | What the bot holds about the person asking, who else sees it, and how long it stays. |
+| `/terms` | What the bot may be used for, and where the money stands. |
+| `/deletemydata` | Erases what the bot holds about the person asking, after one confirmation. |
 
 Restricted to the account ids in `DBOT_ADMIN_ID`, and answering everyone else
 exactly as a misspelt command does: `/providers`, `/probe`,
 `/messageas <user_id> <text>`, `/dbdump` and `/status`.
+
+---
+
+## Privacy and terms
+
+The bot holds personal data from the first message it receives: a Telegram
+user id is the only thing a bot can address a person by, so there is no
+opting out of that one while the bot is in use. `/privacy` says what else is
+kept, who else sees it and how long it stays; `/terms` says what the bot may
+be used for; `/deletemydata` erases it, immediately and without a form.
+
+All three speak whichever of the three languages the person has chosen.
+The long forms are [PRIVACY.md](PRIVACY.md) and [TERMS.md](TERMS.md), which
+is also what the privacy-policy link in Telegram's own bot settings points
+at.
 
 ---
 

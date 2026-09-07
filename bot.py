@@ -96,6 +96,12 @@ from db import (
     record_download,
 )
 from shared_features import (
+    publish_profile,
+    ERASE_PREFIX,
+    delete_my_data_chosen,
+    delete_my_data_command,
+    privacy_command,
+    terms_command,
     refuse_new_work,
     attach_flood_gate,
     attach_maintenance,
@@ -238,6 +244,9 @@ BOT_COMMANDS = [
     BotCommand("en", "Switch to English"),
     BotCommand("uz", "O'zbekchaga o'tish"),
     BotCommand("rus", "Переключиться на русский"),
+    BotCommand("privacy", "What this bot keeps about you"),
+    BotCommand("terms", "What this bot may be used for"),
+    BotCommand("deletemydata", "Erase what this bot holds on you"),
 ]
 
 
@@ -1047,6 +1056,7 @@ async def _post_init(application):
     # between them. See lifecycle.py.
     await lifecycle.on_start(BOT_NAME)
     await application.bot.set_my_commands(BOT_COMMANDS)
+    await publish_profile(application)
 
 
 async def _post_stop(application):
@@ -1112,6 +1122,14 @@ def main():
     app.add_handler(CommandHandler("en", set_language_en))
     app.add_handler(CommandHandler("uz", set_language_uz))
     app.add_handler(CommandHandler("rus", set_language_rus))
+    # ---- what the bot keeps, what it may be used for, and the erase button.
+    # Standalone for the same reason the language switches are: somebody who
+    # wants to know what is held on them, or wants it gone, should not have to
+    # finish whatever they were doing first. ----
+    app.add_handler(CommandHandler("privacy", privacy_command))
+    app.add_handler(CommandHandler("terms", terms_command))
+    app.add_handler(CommandHandler("deletemydata", delete_my_data_command))
+    app.add_handler(CallbackQueryHandler(delete_my_data_chosen, pattern="^" + ERASE_PREFIX))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(platforms.ANY_LINK_RE), handle_link))
 
     # ---- donations (Telegram Stars) -- this bot's only Stars usage ----

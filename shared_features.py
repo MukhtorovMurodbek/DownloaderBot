@@ -9,23 +9,26 @@ family_link.py. Things that live here:
      language picker /start shows, which every bot renders the same way.
   2. A throttled, non-annoying donation reminder + a self-serve /donate
      command paid in Telegram Stars (no external payment processor needed).
-  3. The shared half of /cancel: the states this file can leave a user
+  3. /privacy, /terms and /deletemydata: what this bot keeps on somebody,
+     who else gets to see it, and the command that erases it again.
+  4. The shared half of /cancel: the states this file can leave a user
      waiting in, the release of Telegram's client-side reply lock, and the
      one report format every bot's /cancel answers in.
-  4. Logging setup, unhandled-exception tracking, active-user tracking, and
+  5. Logging setup, unhandled-exception tracking, active-user tracking, and
      hosting-environment detection, all in support of each bot's owner-only
      /status command.
-  5. attach_maintenance()/flush_on_shutdown(): the jobs that keep a
+  6. attach_maintenance()/flush_on_shutdown(): the jobs that keep a
      long-running process cheap -- writing buffered activity counts out in
      batches instead of a row per update, and dropping the cached per-user
      state of people who stopped using the bot months ago.
-  6. attach_flood_gate(): a ceiling on what one person can make the bot do
+  7. attach_flood_gate(): a ceiling on what one person can make the bot do
      per minute, applied before any handler runs.
 """
 import asyncio
 import gc
 import logging
 import os
+import re
 import socket
 import sys
 import time
@@ -38,10 +41,11 @@ from logging.handlers import RotatingFileHandler
 
 from telegram import (
     ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
-    ReplyKeyboardRemove, Update,
+    LinkPreviewOptions, ReplyKeyboardRemove, Update,
 )
+from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter
-from telegram.ext import ApplicationHandlerStop, TypeHandler
+from telegram.ext import ApplicationHandlerStop, ConversationHandler, TypeHandler
 
 import db
 import i18n
@@ -644,22 +648,45 @@ async def donate_command(update, context) -> None:
     await update.message.reply_text(i18n.t(lang, "donate_prompt"), reply_markup=kb)
 
 
+# Callback data is not the button's. It is whatever the client sends back,
+# and a modified client can send anything at all for a button that exists --
+# so the three handlers below check what they are given against what this bot
+# actually offered, exactly as the typed `/donate <amount>` path above always
+# has. Taken on trust, `donate:abc` raised ValueError, `donatefiat:x` raised
+# on the unpack and an unknown currency raised KeyError: three ways for
+# anybody to fill the owner's crash channel from a phone, and a fourth to
+# raise an invoice for an amount no tier offers, which is the one thing
+# MAX_DONATION_STARS exists to prevent.
+
 async def donate_amount_chosen(update, context) -> None:
     query = update.callback_query
-    amount = int(query.data.split(":", 1)[1])
     lang = await i18n.get_lang(update.effective_user.id, context)
+    _, _, tail = (query.data or "").partition(":")
+    if not tail.isdigit() or int(tail) not in DONATE_STAR_OPTIONS:
+        await query.answer(i18n.t(lang, "donate_invalid_amount"), show_alert=True)
+        return
     await query.answer()
-    error = await _send_donation_invoice(query.message.chat_id, update.effective_user, context, amount, lang)
+    error = await _send_donation_invoice(
+        query.message.chat_id, update.effective_user, context, int(tail), lang
+    )
     if error:
         await context.bot.send_message(chat_id=query.message.chat_id, text=error)
 
 
 async def donate_fiat_amount_chosen(update, context) -> None:
     query = update.callback_query
-    _, currency, whole_amount = query.data.split(":", 2)
-    cfg = FIAT_CURRENCIES[currency]
-    amount = int(whole_amount) * (10 ** cfg["exp"])
     lang = await i18n.get_lang(update.effective_user.id, context)
+    parts = (query.data or "").split(":", 2)
+    currency = parts[1] if len(parts) == 3 else ""
+    whole_amount = parts[2] if len(parts) == 3 else ""
+    cfg = FIAT_CURRENCIES.get(currency)
+    # _available_fiat_currencies() and not FIAT_CURRENCIES: a currency that is
+    # known but has no provider token, or is frozen, was never on a button.
+    if (cfg is None or currency not in _available_fiat_currencies()
+            or not whole_amount.isdigit() or int(whole_amount) not in cfg["options"]):
+        await query.answer(i18n.t(lang, "donate_invalid_amount"), show_alert=True)
+        return
+    amount = int(whole_amount) * (10 ** cfg["exp"])
     await query.answer()
     error = await _send_donation_invoice(query.message.chat_id, update.effective_user, context, amount, lang, currency)
     if error:
@@ -671,8 +698,11 @@ async def donate_custom_button_chosen(update, context) -> None:
     actual amount is picked up by donate_custom_amount_received below,
     matched via the donate_custom_currency flag this sets in user_data."""
     query = update.callback_query
-    _, currency = query.data.split(":", 1)
     lang = await i18n.get_lang(update.effective_user.id, context)
+    _, _, currency = (query.data or "").partition(":")
+    if currency != "XTR" and currency not in _available_fiat_currencies():
+        await query.answer(i18n.t(lang, "donate_invalid_amount"), show_alert=True)
+        return
     await query.answer()
     context.user_data["donate_custom_currency"] = currency
     unit = i18n.t(lang, "stars_unit") if currency == "XTR" else FIAT_CURRENCIES[currency]["label"]
@@ -758,6 +788,377 @@ async def donation_payment_callback(update, context) -> None:
     if not sp.invoice_payload.startswith("donate:"):
         return
     await donation_payment_received(update, context)
+
+
+# ---------------------------------------------------------------------------
+# The two screens somebody sees before they ever press Start
+# ---------------------------------------------------------------------------
+# A Telegram bot has three pieces of profile text and the family was setting
+# one of them. set_my_commands fills the slash menu, which only helps once you
+# are already in the chat. The other two are what a stranger meets first:
+#
+#   the short description -- one line, next to the bot in search results and
+#   under its name on the profile card;
+#   the description -- up to 512 characters, and the whole of what an empty
+#   chat shows above the Start button, under "What can this bot do?".
+#
+# Both were blank, so an empty chat said nothing at all and search results
+# showed a name and a username. Both take a language_code, so all three
+# languages go up, and the English text goes up twice: once tagged "en" and
+# once untagged, because the untagged one is what Telegram falls back to for
+# somebody whose client is in German.
+#
+# Called from each bot's _post_init beside set_my_commands. It costs six API
+# calls on a start that happens a few times a day, and it never raises: a rate
+# limit on a cosmetic call is not a reason to fail a deploy.
+
+async def publish_profile(application) -> None:
+    logger = logging.getLogger(__name__)
+    for language in (None,) + tuple(i18n.SUPPORTED_LANGUAGES):
+        lang = language or "en"
+        try:
+            await application.bot.set_my_short_description(
+                short_description=i18n.t(lang, "bot_short_description"),
+                language_code=language,
+            )
+            await application.bot.set_my_description(
+                description=i18n.t(lang, "bot_description"),
+                language_code=language,
+            )
+        except Exception:
+            logger.warning("Could not publish the %s profile text.",
+                           language or "default", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# How a long message is laid out
+# ---------------------------------------------------------------------------
+# Telegram gives a bot four things to design with: bold, a monospace run, an
+# expandable blockquote, and blank lines. That is the whole palette, and it is
+# enough -- what it is not is automatic, and until this existed every screen in
+# the family was one undifferentiated column of sentences. /privacy was the
+# worst of them at about two thousand characters, which on a phone is four
+# thumb-flicks of unbroken grey.
+#
+# The rules, such as they are:
+#
+#   A title line, once, at the top: the subject in bold, with the emoji that
+#   the string already carries. Telegram has no heading levels -- there is
+#   bold and there is not-bold -- so the title and the section headings use
+#   the same helper and are told apart by position.
+#   Section headings in bold, with a blank line above and none below.
+#   Anything longer than a short paragraph goes in an expandable blockquote,
+#   so the shape of the message is visible without scrolling and the detail is
+#   one tap away.
+#   Commands in a monospace run, so /deletemydata reads as a thing to type
+#   rather than as a word in a sentence.
+#
+# EVERYTHING INTERPOLATED IS ESCAPED. The text these wrap comes from i18n.py
+# and is written by whoever translated it; a stray "<" in a Russian string
+# would otherwise take the whole message down with "can't parse entities", and
+# the failure lands on the user as silence rather than as a log line.
+
+# A link in a notice should not drag a preview card in behind it: the card
+# for a GitHub page is a screenful of nothing under a document that is already
+# long. Same call downloader_bot/bot.py makes.
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
+def esc(text: str) -> str:
+    """The three characters Telegram's HTML parser cares about."""
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def heading(text: str) -> str:
+    return f"<b>{esc(text)}</b>"
+
+
+# Two touches that give a translated string structure without the translator
+# having had to think about markup, and without this file having to know which
+# language it is looking at.
+
+_COMMAND_RE = re.compile(r"(?<![\w/])(/[a-z][a-z0-9_]{1,30})\b")
+
+
+def body(text: str) -> str:
+    """Escaped, with every /command in it set as a command.
+
+    A slash-word is a thing to type, and it reads as one when it is in a
+    monospace run and as an ordinary word when it is not -- which matters most
+    in the sentence that offers /deletemydata, since that is the one somebody
+    is scanning for.
+    """
+    return _COMMAND_RE.sub(r"<code>\1</code>", esc(text))
+
+
+def lead_in(text: str, limit: int = 28) -> str:
+    """`Money: it is voluntary` with the lead-in in bold.
+
+    Several strings already open with a short label and a colon, in all three
+    languages, because that is how somebody writes a paragraph that answers a
+    question. Bolding it costs nothing and gives a wall of paragraphs the
+    headings it already implies. A string with no such opening is returned as
+    it is, which is most of them.
+    """
+    label, colon, rest = text.partition(":")
+    if not colon or "\n" in label or len(label) > limit:
+        return body(text)
+    return f"<b>{esc(label)}:</b>{body(rest)}"
+
+
+def collapsed(text: str) -> str:
+    """A blockquote that shows a few lines and opens on a tap.
+
+    Bot API 7.2 and later. An older client -- or an older self-hosted Bot API
+    server -- renders it as an ordinary blockquote, which is a worse but
+    perfectly readable version of the same thing, so there is nothing to
+    detect and nothing to fall back to.
+    """
+    return f"<blockquote expandable>{body(text)}</blockquote>"
+
+
+def quoted(text: str) -> str:
+    """A blockquote that is always open. For a few lines, not for many."""
+    return f"<blockquote>{body(text)}</blockquote>"
+
+
+def joined(*blocks) -> str:
+    """The blocks that are not empty, one blank line between each."""
+    return "\n\n".join(block for block in blocks if block)
+
+
+# The one thing that can still go wrong is a Bot API server too old to know
+# what an expandable blockquote is, which answers 400 rather than degrading.
+# That is a self-hosted-server setup (LOCAL_BOT_API_URL) and nobody's fault,
+# but the user should not pay for it with silence: the same text goes out
+# again with every tag removed. Worth the eight lines -- a bot that cannot
+# answer /privacy is worse than a bot that answers it in plain text.
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _plain(text: str) -> str:
+    return (_TAG_RE.sub("", text).replace("&lt;", "<")
+            .replace("&gt;", ">").replace("&amp;", "&"))
+
+
+async def reply_formatted(message, text: str, **kwargs):
+    try:
+        return await message.reply_text(
+            text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW, **kwargs
+        )
+    except BadRequest as exc:
+        if "parse" not in str(exc).lower() and "entit" not in str(exc).lower():
+            raise
+        logging.getLogger(__name__).warning(
+            "This Telegram server would not parse the formatting (%s); sending plain.", exc
+        )
+        return await message.reply_text(
+            _plain(text), link_preview_options=NO_PREVIEW, **kwargs
+        )
+
+
+# ---------------------------------------------------------------------------
+# /privacy, /terms, /deletemydata -- what is held, and getting rid of it
+# ---------------------------------------------------------------------------
+# A Telegram bot has no cookie banner, no tracking pixel and no third-party
+# embeds, so most of a website's compliance checklist does not apply to one.
+# What does apply is the part underneath: a bot holds personal data from the
+# first message, because a numeric Telegram user id is the only thing it can
+# address a person by, and it cannot ask permission before receiving one.
+#
+# Telegram asks every bot for a privacy policy and gives BotFather a field to
+# put the link in, so there has to be something to link to. Three commands
+# rather than one document nobody opens:
+#
+#   /privacy       what this bot keeps, who else sees it, how long it stays
+#   /terms         what the bot may be used for, and where the money stands
+#   /deletemydata  the erase button that makes the other two mean something
+#
+# A policy is worth what it can be held to, which is why the third command
+# exists. Without it the first two describe a filing cabinet nobody can open.
+#
+# The wording is per-bot on purpose. StickerBot keeps sticker packs, AnonBot
+# keeps who is talking to whom, DownloaderBot hands a link to somebody else's
+# server -- a policy describing "the bot" in the abstract describes none of
+# them truthfully. So this file owns the shape and the handlers, and each
+# bot's i18n.py owns two keys: "privacy_stored", the list of what it actually
+# keeps, and "privacy_others", whoever outside the family it has to talk to.
+# The long forms live in PRIVACY.md and TERMS.md in each bot's repository.
+
+# Who is running this copy, and how to reach them. A privacy notice that
+# cannot name someone to complain to is a notice about nobody. Left blank the
+# commands still work and omit the line, which is the honest result for a
+# local test instance -- better than printing an address that goes nowhere.
+OPERATOR_CONTACT = os.environ.get("OPERATOR_CONTACT", "").strip()
+# Where the long forms were published, if they were. publish.ps1 pushes
+# PRIVACY.md and TERMS.md to each bot's public repository, which gives them a
+# URL; this is where that URL goes, and it is also what BotFather wants.
+PRIVACY_URL = os.environ.get("PRIVACY_URL", "").strip()
+TERMS_URL = os.environ.get("TERMS_URL", "").strip()
+
+
+def _policy_footer(lang: str, url: str) -> str:
+    """The two optional trailing lines, each dropped when unconfigured.
+
+    The URL is the one thing here that is not escaped and must not be: it goes
+    inside an anchor so that it is tappable, and the label is the address
+    itself, because a privacy notice is the wrong place to hide where a link
+    goes behind a word."""
+    lines = []
+    if url:
+        label = esc(url)
+        lines.append(body(i18n.t(lang, "policy_full_text", url="\x00"))
+                     .replace("\x00", f'<a href="{label}">{label}</a>'))
+    if OPERATOR_CONTACT:
+        lines.append(body(i18n.t(lang, "policy_contact", contact=OPERATOR_CONTACT)))
+    return "\n".join(lines)
+
+
+def privacy_text(lang: str) -> str:
+    """The notice, laid out so its shape is visible without scrolling.
+
+    The two long blocks -- the list of what is kept, and the retention
+    paragraphs -- are the ones that go behind a tap. What stays on screen is
+    every heading, who else sees it, and the line offering /deletemydata,
+    which is what somebody opening /privacy is usually looking for.
+    """
+    return joined(
+        heading(i18n.t(lang, "privacy_heading")),
+        heading(i18n.t(lang, "privacy_kept_heading")) + "\n"
+        + collapsed(i18n.t(lang, "privacy_stored")),
+        heading(i18n.t(lang, "privacy_seen_by_heading")) + "\n"
+        + body(i18n.t(lang, "privacy_seen_by")) + "\n"
+        + body(i18n.t(lang, "privacy_others")),
+        heading(i18n.t(lang, "privacy_kept_for_heading")) + "\n"
+        + collapsed(i18n.t(lang, "privacy_kept_for")),
+        lead_in(i18n.t(lang, "privacy_your_choices")),
+        _policy_footer(lang, PRIVACY_URL),
+    )
+
+
+def terms_text(lang: str) -> str:
+    """Four paragraphs, three of which already open with their own label and a
+    colon -- in all three languages, because that is how the sentences were
+    written. lead_in() promotes those to headings; the one without is left as
+    a paragraph, which is what it is."""
+    return joined(
+        heading(i18n.t(lang, "terms_heading")),
+        body(i18n.t(lang, "terms_use")),
+        lead_in(i18n.t(lang, "terms_specific")),
+        lead_in(i18n.t(lang, "terms_money")),
+        lead_in(i18n.t(lang, "terms_no_warranty")),
+        _policy_footer(lang, TERMS_URL),
+    )
+
+
+async def privacy_command(update, context) -> None:
+    lang = await i18n.get_lang(update.effective_user.id, context)
+    await reply_formatted(update.message, privacy_text(lang))
+
+
+async def terms_command(update, context) -> None:
+    lang = await i18n.get_lang(update.effective_user.id, context)
+    await reply_formatted(update.message, terms_text(lang))
+
+
+# ---- erasure ----
+# Two taps rather than one, because there is no undo and on a phone keyboard
+# the command is a slip away from /donate. The confirmation spells out what
+# goes and what does not, per bot: erasing a StickerBot user forgets their
+# packs without deleting the packs themselves, which live on Telegram's
+# servers and not here, and erasing an AnonBot inbox owner breaks every copy
+# of their link that anybody has posted. Both are the right thing to do when
+# asked and the wrong thing to find out about afterwards.
+
+ERASE_PREFIX = "erasedata:"
+
+
+def erase_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(i18n.t(lang, "delete_data_button_yes"), callback_data=ERASE_PREFIX + "yes"),
+        InlineKeyboardButton(i18n.t(lang, "delete_data_button_no"), callback_data=ERASE_PREFIX + "no"),
+    ]])
+
+
+async def delete_my_data_command(update, context):
+    """Returns None on purpose. StickerBot registers this as one of its
+    ConversationHandler's entry points -- same reasoning as the language
+    switches there -- and an entry point returning None leaves the state
+    machine exactly where it was, which is what asking a question should do.
+    Only the answer below moves anything."""
+    lang = await i18n.get_lang(update.effective_user.id, context)
+    # The consequences stay on screen rather than going behind a tap. This is
+    # the one message in the family where the detail is the point: it is what
+    # somebody needs to have read before they press a button that has no undo.
+    await reply_formatted(
+        update.message,
+        joined(heading(i18n.t(lang, "delete_data_confirm")),
+               body(i18n.t(lang, "delete_data_consequences"))),
+        reply_markup=erase_keyboard(lang),
+    )
+
+
+async def delete_my_data_chosen(update, context):
+    """Every edit goes through live_message.edit_in_place rather than
+    query.edit_message_text, for the two reasons that helper exists. It never
+    raises -- and this one really can be asked to write the same text twice,
+    by somebody who taps a second, older confirmation after the first erase
+    already reported nothing to erase -- and it moves the message down to the
+    bottom if the person has said something since.
+
+    Returns ConversationHandler.END after an erase, which StickerBot's entry
+    points honour. Without it the state machine would sit in EDITING pointing
+    at a pack this bot has just forgotten, and the next sticker would raise
+    KeyError('owner_id') and page the owner about a crash that was really
+    somebody exercising their right to be forgotten.
+    """
+    query = update.callback_query
+    await query.answer()
+    lang = await i18n.get_lang(update.effective_user.id, context)
+    if query.data != ERASE_PREFIX + "yes":
+        await live_message.edit_in_place(
+            query.message, context.bot, body(i18n.t(lang, "delete_data_kept")), parse_mode=ParseMode.HTML
+        )
+        return None
+
+    user_id = update.effective_user.id
+    # The two erasures are reported on separately, and deliberately not in
+    # one try. db.erase_user is a single transaction over this bot's own
+    # tables: it either happened or it did not, and that is what the person
+    # is being told about. lifecycle.forget_user clears a cache of work in
+    # progress that expires by itself within the day, so failing it does not
+    # make the answer above it untrue -- and saying "couldn't erase that"
+    # after the data is already gone is the one answer this command must
+    # never give.
+    try:
+        rows = await asyncio.to_thread(db.erase_user, user_id)
+    except Exception:
+        logging.getLogger(__name__).exception("Erasing user %s failed", user_id)
+        await live_message.edit_in_place(
+            query.message, context.bot, body(i18n.t(lang, "delete_data_failed")), parse_mode=ParseMode.HTML
+        )
+        return None
+    try:
+        rows += await asyncio.to_thread(lifecycle.forget_user, user_id)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Cleared %s's data but could not clear their saved state", user_id
+        )
+
+    # Rendered before the cache is dropped, because the chosen language is
+    # part of what is being erased.
+    done = body(i18n.t(lang, "delete_data_done", rows=rows))
+    # Whatever the process still holds in memory, so the persistence flush a
+    # minute later does not write a fresh row straight back out again.
+    try:
+        context.application.drop_user_data(user_id)
+    except Exception:
+        logging.getLogger(__name__).debug("Nothing cached for %s to drop", user_id)
+    await live_message.edit_in_place(
+        query.message, context.bot, done, parse_mode=ParseMode.HTML
+    )
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
@@ -946,11 +1347,25 @@ def build_cancel_text(lang: str, stopped: list[str]) -> str:
     return i18n.t(lang, "cancel_header") + "\n" + "\n".join(f"\u2022 {item}" for item in stopped)
 
 
-async def finish_cancel(update, context, lang: str, stopped: list[str]) -> None:
+async def finish_cancel(update, context, lang: str, stopped: list[str],
+                        stored_only: bool = False) -> None:
     """The last two steps of every bot's /cancel: release the reply lock and
     say what was stopped. ReplyKeyboardRemove is what actually unpins the
-    reply box on the client when the prompt itself was too old to delete."""
-    released = await release_force_reply(update, context)
+    reply box on the client when the prompt itself was too old to delete.
+
+    `stored_only` turns off release_force_reply's second route -- "delete
+    whatever this /cancel is a reply to" -- for bots where that guess is
+    expensive to get wrong. It is a good guess when every message a bot sends
+    is a menu or a status line, and a bad one when its messages are the
+    product: AnonBot's are somebody's conversation, and `/cancel` sent as a
+    reply to one used to delete it and report a prompt that never existed.
+
+    The default is unchanged for the three bots whose messages are menus.
+    They are not entirely safe from it either -- a `/cancel` replying to a
+    converted file or a finished download deletes that too -- but the fix
+    there is a judgement about those bots, not a side effect of this one.
+    """
+    released = await release_force_reply(update, context, stored_only=stored_only)
     # A prompt we could still delete, but nothing in memory to go with it, is
     # the signature of one that outlived the process that sent it: user_data
     # does not survive a restart, but Telegram's reply lock does. Saying

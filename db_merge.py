@@ -34,7 +34,6 @@ import sys
 from contextlib import closing
 from pathlib import Path
 
-import psycopg
 
 import db
 

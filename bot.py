@@ -39,6 +39,7 @@ Env vars: DBOT_TOKEN, DBOT_USERNAME (no @), DBOT_ADMIN_ID (optional,
 import asyncio
 import logging
 import os
+import uuid
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -96,7 +97,9 @@ from db import (
     record_download,
 )
 from shared_features import (
+    note_job,
     publish_profile,
+    publish_commands,
     ERASE_PREFIX,
     delete_my_data_chosen,
     delete_my_data_command,
@@ -247,6 +250,18 @@ BOT_COMMANDS = [
     BotCommand("privacy", "What this bot keeps about you"),
     BotCommand("terms", "What this bot may be used for"),
     BotCommand("deletemydata", "Erase what this bot holds on you"),
+]
+
+# The same menu, in the owner's own chat, with the commands only they can
+# run. Kept out of BOT_COMMANDS on purpose -- a stranger should not be offered
+# /dbdump -- but hidden from the owner too, which was the accident. See
+# publish_commands() in shared_features.py. English, like the rest of the
+# admin output: the only person who sees this list wrote the bot.
+ADMIN_COMMANDS = [
+    BotCommand("status", "🔒 Uptime, host, errors, active users"),
+    BotCommand("providers", "🔒 Which download route works, which is resting"),
+    BotCommand("messageas", "🔒 messageas <user_id> <text> — DM as this bot"),
+    BotCommand("dbdump", "🔒 This bot's tables as a zip of CSVs"),
 ]
 
 
@@ -681,19 +696,94 @@ def _ago(seconds: float) -> str:
     return f"{seconds // 86400}d"
 
 
-def _nudge_kb() -> InlineKeyboardMarkup | None:
+# ---------------------------------------------------------------------------
+# "the other way round", on a button
+# ---------------------------------------------------------------------------
+# Getting the same download in the other quality meant three steps: /lossless,
+# pick the other setting, then find the link and send it again. All the user
+# was ever saying was "that one, but as a file" -- and the /lossless setting
+# is a *preference*, so changing it to get one file the other way leaves it
+# changed for every file after.
+#
+# So the button does the one delivery and touches nothing else. Nothing about
+# the backend changes: it is the same resolve, the same download, the same
+# send, and it counts against the same daily allowance -- because it is a
+# second download, exactly as re-pasting the link would have been.
+#
+# The URL cannot ride in the callback data (64 bytes, and these are share
+# links with tracking parameters), so it is held in user_data under a short
+# token. Bounded, because a tab left open for a week should not be a leak:
+# the last few downloads keep their button and the older ones answer "that
+# one has expired, send the link again", which is one step worse than the
+# button and no worse than before it existed.
+REDELIVER_PREFIX = "redo:"
+REDELIVER_MEMORY = 5
+
+
+def _remember_delivery(context, platform: str, url: str, lossless: bool) -> str:
+    memory = context.user_data.setdefault("redeliver", {})
+    while len(memory) >= REDELIVER_MEMORY:
+        memory.pop(next(iter(memory)))
+    token = uuid.uuid4().hex[:10]
+    memory[token] = {"platform": platform, "url": url, "lossless": lossless}
+    return token
+
+
+def _nudge_kb(lang: str | None = None, token: str | None = None,
+              lossless: bool = False) -> InlineKeyboardMarkup | None:
     # Point at ConvertBot too -- e.g. someone might want just the audio, or
     # a gif, out of what they just downloaded. No file handoff between bots
     # anymore (each bot is fully independent) -- they re-send it there.
+    rows = []
+    if lang is not None and token is not None:
+        # The label says what tapping it *gets you*, not what mode you are in.
+        # "Lossless: off" is a setting; "get it as a file" is a thing that
+        # happens, and only one of the two reads as a button.
+        rows.append([InlineKeyboardButton(
+            i18n.t(lang, "redeliver_as_compressed" if lossless else "redeliver_as_file"),
+            callback_data=f"{REDELIVER_PREFIX}{token}")])
     kb_row = sibling_bots_keyboard_row(BOT_NAME, only="convertbot")
-    return InlineKeyboardMarkup([kb_row]) if kb_row else None
+    if kb_row:
+        rows.append(kb_row)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def redeliver_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The button under a finished download. Runs the ordinary path with the
+    quality flipped for this one delivery, and leaves /lossless alone."""
+    query = update.callback_query
+    lang = await i18n.get_lang(update.effective_user.id, context)
+    token = query.data[len(REDELIVER_PREFIX):]
+    remembered = context.user_data.get("redeliver", {}).get(token)
+    if not remembered:
+        await query.answer(i18n.t(lang, "redeliver_expired"), show_alert=True)
+        return
+    await query.answer()
+    # The button is spent: tapping it twice would download the same file twice
+    # against the same allowance, and the second tap is always a mis-tap. The
+    # markup is edited rather than the text, because the message it is under
+    # is a photo or a video and edit_message_text does not work on those.
+    try:
+        await query.edit_message_reply_markup(reply_markup=_nudge_kb())
+    except Exception:
+        logger.debug("Couldn't take the redeliver button off", exc_info=True)
+
+    allowance = await asyncio.to_thread(download_allowance, update.effective_user.id)
+    if not allowance["allowed"]:
+        await query.message.reply_text(_allowance_message(lang, allowance))
+        return
+    await asyncio.to_thread(record_download, update.effective_user.id, remembered["platform"])
+    await _resolve_and_send(
+        update, context, remembered["platform"], remembered["url"],
+        lossless_override=not remembered["lossless"],
+    )
 
 
 async def _after_send(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
     nudge = await maybe_donation_nudge(
         update.effective_user.id, lang, context, update.effective_chat.id)
     if nudge:
-        await update.message.reply_text(nudge)
+        await update.effective_message.reply_text(nudge)
 
 
 def _image_extension(data: bytes) -> str:
@@ -716,20 +806,49 @@ def _image_extension(data: bytes) -> str:
     return "bin"
 
 
-async def _reply_image(update: Update, data: bytes, stem: str, reply_markup=None):
+async def _reply_image_with_button(update, context, data: bytes, stem: str, lang: str,
+                                   platform: str, url: str,
+                                   lossless: bool | None = None):
+    """An image, with the same "the other way round" button the media path
+    puts under a video. Reddit and Twitter reach the chat through here rather
+    than through _send_media, and a button that appeared under a downloaded
+    video but not under a downloaded picture would read as a bug."""
+    if lossless is None:
+        lossless = await asyncio.to_thread(get_lossless_enabled, update.effective_user.id)
+    token = _remember_delivery(context, platform, url, lossless)
+    return await _reply_image(update, data, stem,
+                              reply_markup=_nudge_kb(lang, token, lossless),
+                              lossless=lossless)
+
+
+async def _reply_image(update: Update, data: bytes, stem: str, reply_markup=None,
+                       lossless: bool | None = None):
     """One image back, compressed as a photo or verbatim as a file -- see
-    lossless_toggle for which and why."""
-    if await asyncio.to_thread(get_lossless_enabled, update.effective_user.id):
-        return await update.message.reply_document(
+    lossless_toggle for which and why.
+
+    `lossless=None` means "whatever this person's setting says", which is
+    every ordinary call. The button passes the opposite of what was just
+    delivered, for that one delivery only."""
+    if lossless is None:
+        lossless = await asyncio.to_thread(get_lossless_enabled, update.effective_user.id)
+    # effective_message rather than message: every send path here is also
+    # reachable from a button, and on a callback-query update `message` is
+    # None while `effective_message` is the message the button is on. Getting
+    # this wrong is an AttributeError inside a download, which the user sees
+    # as the bot going quiet.
+    if lossless:
+        return await update.effective_message.reply_document(
             document=BytesIO(data),
             filename=f"{stem}.{_image_extension(data)}",
             reply_markup=reply_markup,
             disable_content_type_detection=True,
         )
-    return await update.message.reply_photo(BytesIO(data), reply_markup=reply_markup)
+    return await update.effective_message.reply_photo(
+        BytesIO(data), reply_markup=reply_markup)
 
 
-async def _send_media(update, context, items_with_paths, lang) -> None:
+async def _send_media(update, context, items_with_paths, lang,
+                      lossless: bool | None = None, redeliver_token: str | None = None) -> None:
     """Put what was resolved into the chat.
 
     One file goes as a photo or a video so it plays inline; several go as an
@@ -743,7 +862,11 @@ async def _send_media(update, context, items_with_paths, lang) -> None:
     caption = None
     if await asyncio.to_thread(get_caption_enabled, update.effective_user.id):
         caption = i18n.t(lang, "download_credit_caption", username=BOT_USERNAME)
-    lossless = await asyncio.to_thread(get_lossless_enabled, update.effective_user.id)
+    if lossless is None:
+        lossless = await asyncio.to_thread(get_lossless_enabled, update.effective_user.id)
+    keyboard = _nudge_kb(lang, redeliver_token, lossless)
+    # See _reply_image: this is also reached from the redeliver button.
+    message = update.effective_message
 
     if len(items_with_paths) == 1:
         item, path = items_with_paths[0]
@@ -751,20 +874,20 @@ async def _send_media(update, context, items_with_paths, lang) -> None:
         # memory here first.
         with open(path, "rb") as f:
             if lossless:
-                await update.message.reply_document(
+                await message.reply_document(
                     f, filename=os.path.basename(item.filename or path),
-                    caption=caption, reply_markup=_nudge_kb(),
+                    caption=caption, reply_markup=keyboard,
                     read_timeout=120, write_timeout=120,
                     disable_content_type_detection=True,
                 )
             elif item.kind == "video":
-                await update.message.reply_video(
-                    f, caption=caption, reply_markup=_nudge_kb(),
+                await message.reply_video(
+                    f, caption=caption, reply_markup=keyboard,
                     read_timeout=120, write_timeout=120,
                 )
             else:
-                await update.message.reply_photo(
-                    f, caption=caption, reply_markup=_nudge_kb(),
+                await message.reply_photo(
+                    f, caption=caption, reply_markup=keyboard,
                     read_timeout=120, write_timeout=120,
                 )
         return
@@ -786,16 +909,23 @@ async def _send_media(update, context, items_with_paths, lang) -> None:
                     group.append(InputMediaVideo(handle, caption=cap))
                 else:
                     group.append(InputMediaPhoto(handle, caption=cap))
-            await update.message.reply_media_group(
+            await message.reply_media_group(
                 group, read_timeout=120, write_timeout=120)
         finally:
             for handle in handles:
                 handle.close()
+    # Telegram allows no inline keyboard on a media group, so the button that
+    # would have been under the album goes on one line after it.
+    if keyboard is not None:
+        await message.reply_text(
+            i18n.t(lang, "album_delivered", count=len(items_with_paths)),
+            reply_markup=keyboard)
 
 
 async def _resolve_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             platform: str, url: str, status=None,
-                            quiet_if_missing: bool = False) -> bool:
+                            quiet_if_missing: bool = False,
+                            lossless_override: bool | None = None) -> bool:
     """The whole download path: pick a route that is working, fetch, send.
 
     Returns True if something was delivered. On failure the user has already
@@ -814,13 +944,14 @@ async def _resolve_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
     )
     if refusal:
         if status is None:
-            await update.message.reply_text(refusal)
+            await update.effective_message.reply_text(refusal)
         else:
             await status.set(context.bot, refusal)
         return False
 
     if status is None:
-        status = await LiveMessage.reply_to(update.message, i18n.t(lang, "fetching"))
+        status = await LiveMessage.reply_to(
+            update.effective_message, i18n.t(lang, "fetching"))
     else:
         await status.set(context.bot, i18n.t(lang, "fetching"))
 
@@ -838,6 +969,13 @@ async def _resolve_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
             logger.info("no route worked for %s: %s", platform, exc)
             if exc.kind == "missing" and quiet_if_missing:
                 return False
+            # A post with no media in it, or one that is too big, is the bot
+            # working correctly on something it cannot help with -- neither a
+            # success nor a failure, and counted as neither. Only a route
+            # failure counts against the outage alarm, or a quiet afternoon of
+            # text-only links would read as every provider being down.
+            if exc.kind not in ("missing", "too_big"):
+                note_job(False)
             key = {
                 "missing": "download_missing",
                 "blocked": "download_blocked",
@@ -855,12 +993,22 @@ async def _resolve_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
             items = resolved.items
             for item in items:
                 paths.append(await resolvers.download(item))
-            await _send_media(update, context, list(zip(items, paths)), lang)
+            if lossless_override is None:
+                delivered_lossless = await asyncio.to_thread(
+                    get_lossless_enabled, update.effective_user.id)
+            else:
+                delivered_lossless = lossless_override
+            token = _remember_delivery(context, platform, url, delivered_lossless)
+            await _send_media(update, context, list(zip(items, paths)), lang,
+                              lossless=delivered_lossless, redeliver_token=token)
             await status.delete(context.bot)
+            note_job(True)
         except net.FetchError as exc:
+            note_job(False)
             await status.set(context.bot, str(exc), **NO_PREVIEW)
             return False
         except Exception as exc:
+            note_job(False)
             logger.exception("Delivering %s via %s failed", platform, resolved.provider)
             await status.set(context.bot, i18n.t(lang, "download_failed", error=exc),
                              **NO_PREVIEW)
@@ -893,7 +1041,8 @@ async def _handle_reddit(update: Update, context: ContextTypes.DEFAULT_TYPE, url
         if direct_img:
             try:
                 image = await net.fetch_bytes(direct_img)
-                await _reply_image(update, image, "reddit", reply_markup=_nudge_kb())
+                await _reply_image_with_button(
+                    update, context, image, "reddit", lang, "reddit", url)
                 await status.delete(context.bot)
                 await _after_send(update, context, lang)
                 return
@@ -919,7 +1068,8 @@ async def _handle_reddit(update: Update, context: ContextTypes.DEFAULT_TYPE, url
     # rendered as an image, which is the content photo compression damages
     # most visibly, so "lossless" meaning "except the ones with words on"
     # would be the wrong kind of surprising.
-    await _reply_image(update, png, "reddit_post", reply_markup=_nudge_kb())
+    await _reply_image_with_button(
+        update, context, png, "reddit_post", lang, "reddit", url)
     await status.delete(context.bot)
     await _after_send(update, context, lang)
 
@@ -952,7 +1102,8 @@ async def _handle_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
         meta = f"{likes:,} likes" if isinstance(likes, int) else ""
         png = await asyncio.to_thread(
             cards.render_card, "twitter", source, author, tweet.get("text", ""), meta)
-        await _reply_image(update, png, "tweet", reply_markup=_nudge_kb())
+        await _reply_image_with_button(
+            update, context, png, "tweet", lang, "twitter", url)
         await status.delete(context.bot)
         await _after_send(update, context, lang)
         return
@@ -1055,7 +1206,7 @@ async def _post_init(application):
     # still polling, both get 409 Conflict and this bot's updates are split
     # between them. See lifecycle.py.
     await lifecycle.on_start(BOT_NAME)
-    await application.bot.set_my_commands(BOT_COMMANDS)
+    await publish_commands(application, BOT_COMMANDS, ADMIN_COMMANDS, ADMIN_IDS)
     await publish_profile(application)
 
 
@@ -1114,6 +1265,7 @@ def main():
     app.add_handler(CommandHandler("providers", providers_command))  # owner-only
     app.add_handler(CallbackQueryHandler(caption_toggle_callback, pattern="^caption:"))
     app.add_handler(CallbackQueryHandler(lossless_toggle_callback, pattern="^lossless:"))
+    app.add_handler(CallbackQueryHandler(redeliver_callback, pattern="^redo:"))
     app.add_handler(CallbackQueryHandler(cancel_choice_callback, pattern="^cancelpick:"))
     app.add_handler(CallbackQueryHandler(language_chosen, pattern="^setlang:"))
     app.add_handler(CommandHandler("language", language_command))

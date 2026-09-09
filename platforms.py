@@ -32,8 +32,13 @@ INSTAGRAM_RE = re.compile(
 TIKTOK_RE = re.compile(
     r"https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/\S+", re.IGNORECASE
 )
+# Pinterest runs a country subdomain per market -- co.pinterest.com,
+# br.pinterest.com, in.pinterest.com, ru.pinterest.com -- and the share sheet
+# hands out whichever one the sharer was on. Allowing only `www.` meant a link
+# from anywhere but the default host was answered with "that is not a link I
+# recognise", which reads as the bot not supporting Pinterest at all.
 PINTEREST_RE = re.compile(
-    r"https?://(?:www\.)?(?:pinterest\.[a-z.]+|pin\.it)/\S+", re.IGNORECASE
+    r"https?://(?:[a-z0-9-]{1,8}\.)?(?:pinterest\.[a-z.]+|pin\.it)/\S+", re.IGNORECASE
 )
 REDDIT_RE = re.compile(
     r"https?://(?:www\.|old\.|m\.)?reddit\.com/r/\S+|https?://redd\.it/\S+",

@@ -10,7 +10,7 @@ command is needed — pasting a supported link is the whole interface.
 | Instagram | Reels, photo posts and carousels |
 | TikTok | Videos without the watermark, and photo slideshows |
 | Twitter / X | Video and photos; a text-only post is rendered as an image card |
-| Pinterest | The pin's image at full resolution, or its video |
+| Pinterest | The pin's image at full resolution, or its video. Video pins and idea pins both work, and an idea pin of several pages arrives as several files. Any country domain (`co.`, `in.`, `br.` …) and `pin.it` shortlinks are recognised. |
 | Reddit | Media posts directly; text and link posts as an image card |
 
 Runs as its own process, its own repository and its own deployment, and can
@@ -59,7 +59,7 @@ happened, which answers "is it broken, or was that one post private".
 | command | what it does |
 |---|---|
 | *(paste a link)* | Downloads it and sends it back |
-| `/lossless on\|off` | Send downloads as files rather than as photos and videos. Telegram re-encodes anything sent as media — that compression is what makes it play inline, and there is no way to have both — so with this on the bytes arrive exactly as the source had them, at the cost of a tap to open. Off by default, remembered per user. |
+| `/lossless on\|off` | Send downloads as files rather than as photos and videos. Telegram re-encodes anything sent as media — that compression is what makes it play inline, and there is no way to have both — so with this on the bytes arrive exactly as the source had them, at the cost of a tap to open. Off by default, remembered per user. A button under every finished download gets that one file the other way round without changing the setting. |
 | `/caption on\|off` | Toggle the credit caption. |
 | `/cancel` | Asks which of the things the bot is waiting on should stop, one button each. |
 | `/donate` | Voluntary contribution towards hosting, paid in Telegram Stars. |

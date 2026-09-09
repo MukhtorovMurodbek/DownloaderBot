@@ -208,11 +208,6 @@ def _record_fail(name: str, error: str) -> None:
     _health_dirty.add(name)
 
 
-def snapshot() -> dict[str, Health]:
-    """Everything known, for /providers and for the periodic flush."""
-    return dict(_health)
-
-
 def take_dirty() -> dict[str, Health]:
     """The rows that changed since the last flush, and clears the flag.
 
@@ -461,11 +456,18 @@ async def _tt_tnktok(url: str) -> Resolved:
     resp.raise_for_status()
     video = _meta(resp.text, "og:video") or _meta(resp.text, "twitter:player:stream")
     if not video:
-        image = _meta(resp.text, "og:image")
-        if not image:
-            raise ProviderFailed("tnktok had no media for that link", "missing")
-        return Resolved("tiktok", "tnktok", [MediaItem("photo", url=image,
-                                                       filename="tiktok.jpg")])
+        # It used to fall back to og:image here and return a photo. That is
+        # the Pinterest bug: og:image on a *video* post is the cover frame, so
+        # a tnktok that is rate-limited or broken for this post would have
+        # ended the chain with a still, and ytdlp:tiktok -- which handles both
+        # videos and photo slideshows -- would never have been tried.
+        #
+        # Refusing is right in both readings of a missing og:video. If the
+        # post is a video, the image is the wrong file. If it is a slideshow,
+        # og:image is only the first of several and the answer is incomplete.
+        # tikwm, ahead of this in the chain, is the provider that can tell
+        # them apart, because it reads an explicit `images` field.
+        raise ProviderFailed("tnktok exposed no video for that link", "missing")
     return Resolved("tiktok", "tnktok",
                     [MediaItem("video", url=video, filename="tiktok.mp4")])
 
@@ -537,11 +539,103 @@ async def _tw_vxtwitter(url: str) -> Resolved:
 # Pinterest
 # ---------------------------------------------------------------------------
 
+# Pinterest's own read endpoint, which is what the site's front end calls and
+# what yt-dlp uses. It answers without a login, and it is the only source that
+# distinguishes the three kinds of pin from each other:
+#
+#   a plain video pin   `videos.video_list`
+#   a story / idea pin  `story_pin_data.pages[].blocks[].video.video_list`
+#   a photo pin         neither, just `images`
+#
+# It is asked first because the page scrape below cannot tell a video pin from
+# a photo one -- see the comment on _pin_og.
+_PIN_RESOURCE = "https://www.pinterest.com/resource/PinResource/get/"
+_PIN_ID_RE = re.compile(r"/pin/(?:[^/]*?--)?(\d+)")
+
+
+def _pin_best_video(video_list: dict | None) -> str | None:
+    """The biggest .mp4 in one of Pinterest's video_list objects.
+
+    Only mp4: the same list carries HLS playlists (V_HLSV4, V_HLSV3_MOBILE),
+    and an .m3u8 is a manifest rather than a file -- handing one to Telegram
+    would upload a few hundred bytes of text named .mp4.
+    """
+    best, best_pixels = None, -1
+    for entry in (video_list or {}).values():
+        candidate = (entry or {}).get("url") or ""
+        if not candidate.endswith(".mp4"):
+            continue
+        pixels = (entry.get("width") or 0) * (entry.get("height") or 0)
+        if pixels > best_pixels:
+            best, best_pixels = candidate, pixels
+    return best
+
+
+async def _pin_api(url: str) -> Resolved:
+    """Ask Pinterest what the pin actually is."""
+    # A pin.it shortlink carries no id, and a slug URL buries it after a
+    # double dash. One redirect-following GET settles both, and httpx has
+    # already followed it by the time this reads resp.url.
+    resolved_url = str(url)
+    if "/pin/" not in resolved_url or not _PIN_ID_RE.search(resolved_url):
+        try:
+            resolved_url = str((await _get(url)).url)
+        except Exception as exc:
+            raise ProviderFailed(f"couldn't follow that link: {exc}") from exc
+    found = _PIN_ID_RE.search(resolved_url)
+    if not found:
+        raise ProviderFailed("that link has no pin id in it", "missing")
+    pin_id = found.group(1)
+
+    payload = json.dumps({"options": {"id": pin_id,
+                                      "field_set_key": "unauth_react_main_pin"},
+                          "context": {}})
+    try:
+        resp = await _get(_PIN_RESOURCE, params={"data": payload},
+                          headers={"X-Pinterest-PWS-Handler": "www/[username].js"})
+        resp.raise_for_status()
+        data = resp.json()["resource_response"]["data"]
+    except Exception as exc:
+        raise ProviderFailed(f"pinterest would not describe that pin: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ProviderFailed("pinterest returned no pin", "missing")
+
+    items: list[MediaItem] = []
+    video = _pin_best_video((data.get("videos") or {}).get("video_list"))
+    if video:
+        items.append(MediaItem("video", url=video, filename="pinterest.mp4"))
+
+    # A story pin is several pages, each with blocks. Every video block is a
+    # separate file, in order, the same way a carousel is.
+    for page in ((data.get("story_pin_data") or {}).get("pages") or []):
+        for block in (page.get("blocks") or []):
+            block_video = _pin_best_video((block.get("video") or {}).get("video_list"))
+            if block_video:
+                items.append(MediaItem("video", url=block_video,
+                                       filename=f"pinterest_{len(items) + 1}.mp4"))
+
+    if not items:
+        # A photo pin, or a kind this does not know. `orig` is the full-size
+        # image and is what _pin_og reconstructs by hand.
+        original = ((data.get("images") or {}).get("orig") or {}).get("url")
+        if not original:
+            raise ProviderFailed("that pin has no video or image", "missing")
+        items.append(MediaItem("photo", url=original,
+                               filename=f"pinterest.{_ext_of(urlparse(original).path, 'jpg')}"))
+    return Resolved("pinterest", "api", items)
+
+
 async def _pin_og(url: str) -> Resolved:
-    """A pin's own page still carries og:image (and og:video for video pins)
-    without a login. Pinterest is the one platform here that never needed a
-    workaround, which is worth remembering the next time one of the others
-    looks unfixable."""
+    """The pin page's own OpenGraph tags -- the fallback for when the endpoint
+    above changes shape.
+
+    It cannot be the first route any more. Pinterest stopped emitting
+    `og:video`, so on a video pin this finds no video, falls through to
+    `og:image` -- which is present, because it is the video's cover frame --
+    and *succeeds* with a photo. A provider that succeeds ends the chain, so
+    yt-dlp was never reached and a video pin quietly downloaded a still.
+    Nothing errored; the user just got the wrong file.
+    """
     resp = await _get(url)
     resp.raise_for_status()
     video = _meta(resp.text, "og:video") or _meta(resp.text, "og:video:secure_url")
@@ -614,7 +708,10 @@ PROVIDERS: dict[str, list[tuple[str, object]]] = {
         ("fxtwitter", _tw_fxtwitter),
         ("ytdlp:twitter", _ytdlp_provider("twitter")),
     ],
+    # api first: it is the only one of the three that can tell a video pin
+    # from a photo pin, and getting that wrong is silent rather than loud.
     "pinterest": [
+        ("pinterest_api", _pin_api),
         ("pinterest_og", _pin_og),
         ("ytdlp:pinterest", _ytdlp_provider("pinterest")),
     ],

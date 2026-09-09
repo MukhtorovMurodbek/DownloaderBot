@@ -238,6 +238,13 @@ STRINGS = {
             "Pinterest, Reddit, or Twitter/X — paste one to download it, or "
             "/help for commands."
         ),
+        "redeliver_as_file": "📄 Get it as an uncompressed file",
+        "redeliver_as_compressed": "🖼 Get it compressed instead",
+        "redeliver_expired": (
+            "That one is too old for the button now — send the link again, or use "
+            "/lossless to change how everything arrives."
+        ),
+        "album_delivered": "{count} files above.",
         "unknown_command": "I don't recognize that command. Send /help to see what I can do.",
     },
     "uz": {
@@ -447,6 +454,13 @@ STRINGS = {
             "Pinterest, Reddit yoki Twitter/X — yuklab olish uchun shulardan "
             "birini yuboring yoki buyruqlar uchun /help ni bosing."
         ),
+        "redeliver_as_file": "📄 Siqilmagan fayl sifatida olish",
+        "redeliver_as_compressed": "🖼 Siqilgan holda olish",
+        "redeliver_expired": (
+            "Bu tugma uchun juda eski — havolani qayta yuboring yoki hammasi qanday "
+            "kelishini /lossless orqali o'zgartiring."
+        ),
+        "album_delivered": "Yuqorida {count} ta fayl.",
         "unknown_command": "Bu buyruqni tanimadim. Nima qila olishimni bilish uchun /help yuboring.",
     },
     "ru": {
@@ -649,6 +663,13 @@ STRINGS = {
             "Pinterest, Reddit или Twitter/X — пришли одну из них, чтобы скачать, "
             "или /help для списка команд."
         ),
+        "redeliver_as_file": "📄 Получить несжатым файлом",
+        "redeliver_as_compressed": "🖼 Получить сжатым",
+        "redeliver_expired": (
+            "Для кнопки это уже слишком старая загрузка — пришли ссылку заново или "
+            "поменяй способ доставки через /lossless."
+        ),
+        "album_delivered": "Выше {count} файл(ов).",
         "unknown_command": "Я не знаю такую команду. Отправь /help, чтобы увидеть, что я умею.",
     },
 }

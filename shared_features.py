@@ -34,14 +34,17 @@ import sys
 import time
 import traceback
 import uuid
+import zlib
 from collections import OrderedDict, deque, namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
 from telegram import (
-    BotCommandScopeChat, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup,
-    LabeledPrice, LinkPreviewOptions, ReplyKeyboardRemove, Update,
+    BotCommand, BotCommandScopeAllChatAdministrators, BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats, BotCommandScopeChat, ForceReply, InlineKeyboardButton,
+    InlineKeyboardMarkup, LabeledPrice, LinkPreviewOptions, ReplyKeyboardRemove,
+    Update,
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter
@@ -52,6 +55,7 @@ import family_link
 import i18n
 import lifecycle
 import live_message
+import problems
 
 # ---------------------------------------------------------------------------
 # Sibling-bot cross-promotion
@@ -75,6 +79,15 @@ def _parse_sibling_bots() -> list[dict]:
         bot_id, name, username = parts
         bots.append({"id": bot_id, "name": name, "username": username})
     return bots
+
+
+def _convert_bot_name() -> str:
+    """ConvertBot as somebody can tap it -- its @username from SIBLING_BOTS --
+    or just its name when this deployment does not list it."""
+    for bot in _parse_sibling_bots():
+        if bot["id"] == "convertbot":
+            return "@" + bot["username"]
+    return "ConvertBot"
 
 
 def sibling_bots_blurb(this_bot_name: str, lang: str) -> str:
@@ -239,7 +252,7 @@ def _flood_should_tell(user_id: int) -> bool:
     return True
 
 
-def attach_flood_gate(app, admin_ids=(), group: int = -3) -> None:
+def attach_flood_gate(app, admin_ids=(), group: int = -3, exempt=None) -> None:
     """Register in a group of its OWN, above every other group.
 
     Its own group because python-telegram-bot runs one handler per group and
@@ -248,6 +261,10 @@ def attach_flood_gate(app, admin_ids=(), group: int = -3) -> None:
     /messageas and a sweep through /status are the bot's own operator using
     it, and being throttled out of your own bot during an incident is the
     wrong failure.
+
+    `exempt`, if given, is asked about each update first, and True lets it
+    through uncounted. AnonBot's /export uses it for the forwards it asked
+    for, which arrive a hundred at a time.
     """
     admins = set(admin_ids)
 
@@ -255,6 +272,12 @@ def attach_flood_gate(app, admin_ids=(), group: int = -3) -> None:
         user = update.effective_user
         if user is None or user.id in admins:
             return
+        if exempt is not None:
+            try:
+                if exempt(update):
+                    return
+            except Exception:
+                logging.getLogger(__name__).debug("Flood exemption check failed", exc_info=True)
         wait = flood_wait_seconds(user.id)
         if not wait:
             return
@@ -350,6 +373,34 @@ DONATE_STAR_OPTIONS = [15, 50, 150, 500]
 # Telegram's own error text back to the sender), just a guard against an
 # obvious typo like an extra zero or two.
 MAX_DONATION_STARS = 100_000
+
+# ---------------------------------------------------------------------------
+# Paying without paying, for TestBot
+# ---------------------------------------------------------------------------
+# With this on, a Stars top-up skips Telegram entirely: no invoice is sent,
+# nothing is charged, and the credit lands in the balance exactly as a real
+# payment would put it there. It exists because the alternative for testing
+# the money path is spending real Stars on every run, and the part worth
+# testing is what happens *after* the payment -- the rate, the first-payment
+# bonus, the ledger row, the balance the user is shown.
+#
+# It is off unless the environment says otherwise, and the environment that
+# says otherwise is testbot/token.env. Two things make it safe to have in the
+# shared file rather than in a fork of it:
+#
+#   every message it produces says so, in the user's own language, so nobody
+#   can believe they paid;
+#   it logs a warning at import, so a production process that somehow had it
+#   set would say so in the first line of its log rather than silently
+#   handing out free credit.
+#
+# Fiat is deliberately not covered: a card payment has a provider behind it
+# and a sandbox for it belongs to that provider, not here.
+STARS_SANDBOX = os.environ.get("FAMILY_STARS_SANDBOX", "").strip().lower() in ("1", "true", "yes", "on")
+if STARS_SANDBOX:
+    logging.getLogger(__name__).warning(
+        "FAMILY_STARS_SANDBOX is on: Stars top-ups will be credited WITHOUT charging anybody. "
+        "This must never be set on a bot real people use.")
 
 # ---- optional fiat alternative (USD) to Stars ----
 # Cashing Stars out to real money goes through Fragment (Stars -> TON ->
@@ -535,6 +586,49 @@ async def unpin_donation_nudge(context, user_id: int, chat_id: int) -> None:
         pass
 
 
+async def _credit_topup(update_or_chat, context, user, amount: int, lang: str,
+                        payload: str, charge_id: str | None, sandbox: bool = False) -> str:
+    """Turn a completed payment into credit, and say what it bought.
+
+    The one place money becomes balance, so the real payment path and the
+    sandbox path cannot drift apart -- which for a thing that hands out
+    credit is the drift that matters.
+
+    Returns the text to send. It always names three things: what was
+    charged, what was credited, and what the credit can and cannot do. The
+    last of those is not decoration -- credit is worth more than the Stars
+    paid for it and cannot be paid back out, so a message that only said
+    "thank you for 15 ⭐" would be describing a donation rather than the
+    purchase this now is.
+    """
+    await asyncio.to_thread(db.update_star_transaction, payload, "paid", charge_id)
+    result = await asyncio.to_thread(family_link.topup, user.id, amount,
+                                     "sandbox top-up" if sandbox else "stars top-up")
+    # `total` and `convert_bot` are for the bots that take donations: there the
+    # thank-you says the credit arrived in ConvertBot, the one place it can be
+    # spent. ConvertBot's own wording does not use them.
+    text = i18n.t(lang, "topup_thanks", stars=result["stars"],
+                  credited=result["credited"], balance=result["balance"],
+                  total=result["credited"] + result["bonus"], convert_bot=_convert_bot_name())
+    if result["bonus"]:
+        text += "\n" + i18n.t(lang, "topup_thanks_bonus", bonus=result["bonus"],
+                                  date=result["bonus_expires"].strftime("%d.%m.%Y")
+                                  if result.get("bonus_expires") else "?")
+    text += "\n\n" + i18n.t(lang, "credit_cannot_be_withdrawn")
+    if sandbox:
+        text = i18n.t(lang, "sandbox_notice") + "\n\n" + text
+    # What was paid and what it bought, not who paid: the owner reads the
+    # family log, and wants no user details in it. The ledger keeps the id,
+    # which is where /balance <id> looks when somebody asks.
+    emit_event(
+        "info", "payment",
+        ("SANDBOX top-up (nothing charged): " if sandbox else "Top-up: ")
+        + f"{result['stars']} XTR -> {result['credited']} credit"
+        + (f" +{result['bonus']} bonus" if result["bonus"] else ""),
+    )
+    return text
+
+
 async def _send_donation_invoice(chat_id: int, user, context, amount: int, lang: str, currency: str = "XTR") -> str | None:
     """amount is in the currency's smallest unit for fiat (see
     FIAT_CURRENCIES), or a plain Stars count for XTR. Returns None on
@@ -552,12 +646,29 @@ async def _send_donation_invoice(chat_id: int, user, context, amount: int, lang:
         db.record_star_invoice, user.id, user.username, amount, "donation", payload,
         "invoiced", currency,
     )
+    if STARS_SANDBOX and currency == "XTR":
+        # No invoice, no precheckout, no successful_payment update -- so this
+        # credits the balance itself rather than waiting for a callback that
+        # is never coming. The charge id records which path wrote the row, so
+        # a sandbox top-up is distinguishable in the ledger forever rather
+        # than looking like money that arrived.
+        text = await _credit_topup(chat_id, context, user, amount, lang,
+                                   payload, f"sandbox:{payload}", sandbox=True)
+        await context.bot.send_message(chat_id=chat_id, text=text)
+        return None
+
     provider_token = "" if currency == "XTR" else (_fiat_provider_token(currency) or "")
     try:
         await context.bot.send_invoice(
             chat_id=chat_id,
             title=i18n.t(lang, "donate_invoice_title"),
-            description=i18n.t(lang, "donate_invoice_description"),
+            # Fiat buys no credit (see donation_payment_received), so its
+            # invoice must not say it does -- it used to render "adds 500 ⚡"
+            # for a five-dollar donation, from the amount in cents.
+            description=(i18n.t(lang, "donate_invoice_description",
+                                credited=(await asyncio.to_thread(family_link.quote_topup, user.id, amount))["total"])
+                         if currency == "XTR"
+                         else i18n.t(lang, "donate_invoice_description_fiat")),
             payload=payload,
             provider_token=provider_token,  # empty string is required for Telegram Stars payments
             currency=currency,
@@ -633,7 +744,7 @@ async def donate_command(update, context) -> None:
     kb_rows = [
         [
             InlineKeyboardButton(
-                f"{amount} {symbol}",
+                _donate_button_label(ccy, amount, symbol),
                 callback_data=f"donate:{amount}" if ccy == "XTR" else f"donatefiat:{ccy}:{amount}",
             )
             for (ccy, _, symbol), amount in zip(columns, row)
@@ -646,7 +757,30 @@ async def donate_command(update, context) -> None:
     ])
     kb = InlineKeyboardMarkup(kb_rows)
 
-    await update.message.reply_text(i18n.t(lang, "donate_prompt"), reply_markup=kb)
+    # Said before the amount is chosen, not only in the thank-you: a Stars
+    # payment becomes credit that cannot be taken back out, and nobody should
+    # find that out after paying.
+    # What THIS person's next Stars earn: the ladder counts every Star they
+    # have ever paid, so the same button means a different amount of credit
+    # for somebody new than for somebody who has paid a thousand.
+    totals = await asyncio.to_thread(family_link.star_totals, update.effective_user.id)
+    multiplier, left = family_link.ladder_position(totals["stars_paid"])
+    base_rate = family_link.credit_for_stars(1)
+    if left:
+        credit_line = i18n.t(lang, "donate_prompt_credit", left=left, mult=f"{multiplier:g}",
+                             each=f"{base_rate * multiplier:g}", rate=base_rate,
+                             days=family_link.BONUS_EXPIRY_DAYS)
+    else:
+        credit_line = i18n.t(lang, "donate_prompt_credit_base", rate=base_rate)
+    prompt = i18n.t(lang, "donate_prompt") + "\n\n" + credit_line
+    await update.message.reply_text(prompt, reply_markup=kb)
+
+
+def _donate_button_label(ccy: str, amount: int, symbol: str) -> str:
+    """The amount and its currency. The bonus is no longer on the button: it
+    depends on what this person has paid before, across all their payments,
+    so the prompt above the buttons says what their next Stars earn."""
+    return f"{amount} {symbol}"
 
 
 # Callback data is not the button's. It is whatever the client sends back,
@@ -754,23 +888,93 @@ async def donation_precheckout(query) -> None:
 
 
 async def donation_payment_received(update, context) -> None:
-    """Caller has already confirmed the payload starts with 'donate:'."""
+    """Caller has already confirmed the payload starts with 'donate:'.
+
+    A payment used to end in a thank-you and nothing else. Now it ends in
+    credit, through the same _credit_topup the sandbox uses -- so what a
+    tester sees and what a payer sees are produced by one function.
+
+    Fiat still only gets the thank-you: the credit rate is defined against
+    Stars, and inventing an exchange rate from a currency's minor units would
+    be making up a number.
+    """
     sp = update.message.successful_payment
-    await asyncio.to_thread(
-        db.update_star_transaction, sp.invoice_payload, "paid", sp.telegram_payment_charge_id
-    )
     user = update.effective_user
-    emit_event(
-        "info", "payment",
-        f"Donation received: {format_ledger_amount(sp.total_amount, sp.currency)} "
-        f"from {user.id}" + (f" (@{user.username})" if user.username else ""),
-    )
     lang = await i18n.get_lang(update.effective_user.id, context)
-    await update.message.reply_text(i18n.t(lang, "donate_thanks", amount=sp.total_amount))
+    if sp.currency == "XTR":
+        text = await _credit_topup(update, context, user, sp.total_amount, lang,
+                                   sp.invoice_payload, sp.telegram_payment_charge_id)
+        await update.message.reply_text(text)
+    else:
+        await asyncio.to_thread(
+            db.update_star_transaction, sp.invoice_payload, "paid",
+            sp.telegram_payment_charge_id
+        )
+        emit_event(
+            "info", "payment",
+            f"Donation received: {format_ledger_amount(sp.total_amount, sp.currency)}",
+        )
+        await update.message.reply_text(i18n.t(lang, "donate_thanks", amount=sp.total_amount))
     # The ask is over for this person -- _donation_nudge_due checks the same
     # paid row and will never fire again, and anything still pinned comes
     # down now rather than sitting above a thank-you.
     await unpin_donation_nudge(context, user.id, update.effective_chat.id)
+
+
+# How a ledger reason reads in /balance. Reasons stay short English tokens (see
+# below), but "refund" beside credit coming back reads as Stars coming back,
+# and in what the bots say only Stars are ever refunded -- and they are not.
+_LEDGER_LABELS = {"refund": "returned"}
+
+
+async def balance_command(update, context) -> None:
+    """/balance -- what this person is holding, and what it is for.
+
+    Registered by every bot rather than only by the ones that charge, because
+    the balance is one wallet for the whole family: somebody who topped up in
+    StickerBot has to be able to ask StickerBot where it went.
+
+    It always prints the rate and the no-withdrawal line, not only when the
+    balance is zero. A number on its own invites exactly the wrong question
+    later -- "can I have it back" -- and the answer costs nothing to give
+    before it is asked.
+    """
+    user = update.effective_user
+    lang = await i18n.get_lang(user.id, context)
+    totals = await asyncio.to_thread(family_link.star_totals, user.id)
+    rows = await asyncio.to_thread(family_link.star_ledger_for, user.id, 8)
+    lines = [i18n.t(lang, "balance_header", balance=totals["balance"])]
+    if totals["stars_paid"] > 0 or totals["spent"] > 0:
+        lines.append(i18n.t(lang, "balance_totals", paid=totals["stars_paid"],
+                            credited=totals["topped_up"], spent=totals["spent"]))
+    lines.append("")
+    if totals.get("bonus"):
+        lines.append(i18n.t(lang, "balance_bonus_line", bonus=totals["bonus"],
+                            soon=totals["bonus_next_amount"],
+                            date=totals["bonus_next_expiry"].strftime("%d.%m.%Y")))
+    multiplier, left = family_link.ladder_position(totals["stars_paid"])
+    base_rate = family_link.credit_for_stars(1)
+    if left:
+        lines.append(i18n.t(lang, "balance_rate", left=left, mult=f"{multiplier:g}",
+                            each=f"{base_rate * multiplier:g}"))
+    else:
+        lines.append(i18n.t(lang, "balance_rate_base", rate=base_rate))
+    lines.append(i18n.t(lang, "credit_cannot_be_withdrawn"))
+    if rows:
+        lines.append("")
+        lines.append(i18n.t(lang, "balance_recent"))
+        for row in rows:
+            when = row["occurred_at"].strftime("%d %b")
+            sign = "+" if row["delta"] > 0 else ""
+            # The reason is a short English token from LEDGER_REASONS rather
+            # than a translated phrase, the same choice /mystars makes about
+            # ledger data: one word that groups rows, not prose.
+            lines.append(f"  {when}  {sign}{row['delta']} ⚡  "
+                         f"{_LEDGER_LABELS.get(row['reason'], row['reason'])}")
+    if not rows and totals["balance"] == 0:
+        lines.append("")
+        lines.append(i18n.t(lang, "balance_empty_hint"))
+    await update.message.reply_text("\n".join(lines))
 
 
 # ---- full standalone handlers, for bots (like StickerBot) whose ONLY Stars
@@ -859,27 +1063,151 @@ async def publish_profile(application) -> None:
 #   set_my_commands for a chat Telegram has never seen fails. An admin who has
 #   never opened their own bot is exactly that chat, so this never raises: a
 #   cosmetic call is not a reason to fail a deploy, same as publish_profile.
+#
+# AND IN THREE LANGUAGES, SINCE v1.6.0
+# The bots answer in English, Uzbek and Russian everywhere except the one list
+# somebody reads before they have understood anything. A menu also takes a
+# language_code -- the same way publish_profile() already sends the profile
+# text three times -- and Telegram picks the list matching the client's own
+# language, falling back to the untagged one.
+#
+# So English lives in each bot's BOT_COMMANDS, where the menu can be read by
+# reading bot.py, and the other two live in i18n.COMMAND_MENU keyed by command
+# name. A command with no translation keeps its English description rather
+# than disappearing from that language's menu, which is the one failure mode
+# worth designing against: a half-translated menu is missing commands, and a
+# missing command looks like a bot that cannot do the thing.
+#
+# Four commands are deliberately NOT translated, and they are the four that
+# look most like they should be. /en, /uz and /rus are each described in the
+# language they switch *to*, and /language is described in all three at once.
+# A per-language menu does not change that: somebody whose client is Russian
+# but who wants Uzbek has to recognise "O'zbekchaga o'tish", and somebody who
+# set the wrong language needs /language to be legible whatever the menu is
+# currently in. They are the way back, so they are written for everyone.
+#
+# The owner's scoped menu stays untagged English. All admin output in this
+# family is English by policy, and the owner is the one reader whose language
+# is not in question.
+
+def _menu_in(commands, language: str):
+    """`commands` with each description swapped for its `language` one.
+
+    Falls back per command, not per menu: an untranslated entry keeps its
+    English text and the rest of the list is still translated.
+    """
+    table = getattr(i18n, "COMMAND_MENU", {}).get(language) or {}
+    return [BotCommand(c.command, table.get(c.command) or c.description)
+            for c in commands]
+
+
+# ---------------------------------------------------------------------------
+# A menu in the language somebody chose
+# ---------------------------------------------------------------------------
+# Telegram picks which of the per-language menus to show from the language
+# the person's Telegram APP is set to, not from anything a bot knows. So /uz
+# changed every message this bot sends and left the menu in English for
+# anybody whose phone is in English or Russian -- which in Uzbekistan is most
+# people who would choose Uzbek. A menu set for one chat (BotCommandScopeChat)
+# outranks every language list, so choosing a language now sets one.
+#
+# The catch with a per-chat menu is that it is frozen when it is set: a
+# command added in a later version would never reach it. Each person's
+# user_data remembers a signature of the menu they were given, and
+# track_activity compares it with what they would be given now, and sets it
+# again when the two differ. One call per person per change, made the next
+# time they use the bot rather than all at once at startup.
+
+MENU_SIGNATURE_KEY = "_menu_sig"
+_MENU: dict = {}
+
+
+def _menu_for(user_id: int, lang: "str | None"):
+    """The menu this person should have, or None before publish_commands has
+    said what the menus are."""
+    public = _MENU.get("public")
+    if public is None:
+        return None
+    commands = list(public) if lang in (None, "en") else _menu_in(public, lang)
+    if user_id in _MENU.get("admin_ids", ()):
+        commands = list(commands) + list(_MENU.get("admin_only", ()))
+    return commands
+
+
+def _menu_signature(commands) -> str:
+    text = "\n".join(f"{c.command}\t{c.description}" for c in commands)
+    return format(zlib.crc32(text.encode("utf-8")), "08x")
+
+
+async def refresh_chat_menu(context, user_id: int, lang: "str | None") -> None:
+    """Give one person's chat the menu in their language. Never raises: a
+    menu is cosmetic, and a failure here must not cost anybody the language
+    change they asked for."""
+    commands = _menu_for(user_id, lang)
+    if not commands:
+        return
+    try:
+        await context.bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=user_id))
+    except Exception:
+        logging.getLogger(__name__).debug("Could not set the chat menu for %s", user_id, exc_info=True)
+        return
+    context.user_data[MENU_SIGNATURE_KEY] = _menu_signature(commands)
+
+
+# Scopes this code never writes. Telegram resolves a chat's menu by scope
+# precedence -- a chat's own, then all-private-chats, then the default -- so
+# a menu left in one of these by anything else outranks the default the code
+# does write, and reading the default says everything is fine. That is what
+# kept StickerBot's commands on TestBot's token long after it ran ConvertBot's
+# code. They are cleared on every start, so the code is the only authority.
+_UNOWNED_SCOPES = (
+    BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeAllChatAdministrators,
+)
+
 
 async def publish_commands(application, public, admin_only=(), admin_ids=()) -> None:
-    """The default menu for everyone, and a longer one in the owner's chat."""
+    """The default menu for everyone, in every language; the scopes the code
+    does not own, cleared; and the owner's chat, in the owner's language."""
     logger = logging.getLogger(__name__)
-    try:
-        await application.bot.set_my_commands(list(public))
-    except Exception:
-        logger.warning("Could not publish the command menu.", exc_info=True)
+    public = list(public)
+    _MENU.update(public=public, admin_only=list(admin_only), admin_ids=set(admin_ids))
+
+    # None first: the untagged list is what a client in a fourth language
+    # gets, so it goes up even if every tagged one fails after it.
+    for language in (None,) + tuple(i18n.SUPPORTED_LANGUAGES):
+        try:
+            await application.bot.set_my_commands(
+                public if language in (None, "en") else _menu_in(public, language),
+                language_code=language,
+            )
+        except Exception:
+            logger.warning("Could not publish the %s command menu.",
+                           language or "default", exc_info=True)
+
+    for scope in _UNOWNED_SCOPES:
+        for language in (None,) + tuple(i18n.SUPPORTED_LANGUAGES):
+            try:
+                await application.bot.delete_my_commands(scope=scope(), language_code=language)
+            except Exception:
+                logger.debug("Could not clear the %s menu (%s).", scope.__name__,
+                             language or "untagged", exc_info=True)
 
     if not admin_only:
         return
     for admin_id in sorted(admin_ids):
+        lang = None
+        try:
+            lang = await asyncio.to_thread(db.get_user_language, admin_id)
+        except Exception:
+            logger.debug("Could not read the language of admin %s", admin_id, exc_info=True)
         try:
             await application.bot.set_my_commands(
-                list(public) + list(admin_only),
+                _menu_for(admin_id, lang),
                 scope=BotCommandScopeChat(chat_id=admin_id),
             )
         except Exception:
             logger.warning("Could not publish the owner's command menu to %s.",
                            admin_id, exc_info=True)
-
 
 # ---------------------------------------------------------------------------
 # How a long message is laid out
@@ -1041,7 +1369,10 @@ async def reply_formatted(message, text: str, **kwargs):
 # cannot name someone to complain to is a notice about nobody. Left blank the
 # commands still work and omit the line, which is the honest result for a
 # local test instance -- better than printing an address that goes nowhere.
-OPERATOR_CONTACT = os.environ.get("OPERATOR_CONTACT", "").strip()
+# The owner's contact, as the default rather than only an environment
+# variable: an unset variable on one Railway service used to mean that bot's
+# /privacy named nobody. A deployment run by somebody else sets its own.
+OPERATOR_CONTACT = (os.environ.get("OPERATOR_CONTACT") or "mukhtorovmurodbek@gmail.com").strip()
 # Where the long forms were published, if they were. publish.ps1 pushes
 # PRIVACY.md and TERMS.md to each bot's public repository, which gives them a
 # URL; this is where that URL goes, and it is also what BotFather wants.
@@ -1130,6 +1461,20 @@ def erase_keyboard(lang: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(i18n.t(lang, "delete_data_button_yes"), callback_data=ERASE_PREFIX + "yes"),
         InlineKeyboardButton(i18n.t(lang, "delete_data_button_no"), callback_data=ERASE_PREFIX + "no"),
     ]])
+
+
+async def paysupport_command(update, context) -> None:
+    """/paysupport -- required of every bot that takes Telegram Stars.
+
+    Telegram's rules for digital goods say a bot must answer /paysupport and
+    handle payment problems itself. The owner decided payments are final, so
+    this says that first, and then how a payment that went wrong -- charged
+    with no credit to show for it -- reaches somebody who can put it right,
+    which here means with credit rather than with Stars."""
+    user = update.effective_user
+    lang = await i18n.get_lang(user.id, context)
+    await update.message.reply_text(i18n.t(
+        lang, "paysupport_text", contact=OPERATOR_CONTACT or "@BotFather", user_id=user.id))
 
 
 async def delete_my_data_command(update, context):
@@ -1497,7 +1842,7 @@ _recent_errors: deque[tuple[str, str]] = deque(maxlen=10)
 _error_count = 0
 
 # Set by family_link.attach() to family_link.report_event_soon, so anything
-# worth waking the owner up for also reaches ParentBot. Left as None when a
+# worth waking the owner up for also reaches ManagerBot. Left as None when a
 # bot runs standalone (FAMILY_BUS=off, or no shared database reachable) --
 # every call site below tolerates that, and none of them may ever raise:
 # the most important caller is record_error(), i.e. the crash path itself.
@@ -1600,8 +1945,21 @@ _network_blips_total = 0  # since this process started
 _network_alerted = False
 
 
+# PTB raises Telegram's HTTP 413 -- "Request Entity Too Large" -- as a plain
+# NetworkError, so it matched the tuple above and was filed as a flaky
+# connection. It is the opposite: permanent, and the same upload fails every
+# time. That is how two successful ConvertBot conversions of a 200 MP photo
+# vanished -- result converted, upload refused, error handler said "retried
+# by PTB", user told nothing, credit kept. Anything whose text says the
+# payload is too big is a real failure, whatever class it arrived as.
+PERMANENT_NETWORK_MESSAGES = ("entity too large", "file is too big", "too big", "too large")
+
+
 def is_transient_network_error(exc: BaseException) -> bool:
-    return isinstance(exc, TRANSIENT_NETWORK_ERRORS) and not isinstance(exc, BadRequest)
+    if not isinstance(exc, TRANSIENT_NETWORK_ERRORS) or isinstance(exc, BadRequest):
+        return False
+    text = str(exc).lower()
+    return not any(marker in text for marker in PERMANENT_NETWORK_MESSAGES)
 
 
 def note_network_blip(exc: BaseException) -> None:
@@ -1659,6 +2017,283 @@ def error_summary() -> str:
     return "\n".join(lines) + blips
 
 
+# ---------------------------------------------------------------------------
+# Problem codes, and the button that reports one
+# ---------------------------------------------------------------------------
+# The owner: "Give every possible exception that the user might trigger a code
+# or a unique identifier. If user triggers something with such an error, they
+# should get a button too, that says 'report the issue'." The codes and what
+# they mean are in problems.py; i18n.t() ends every coded message with its
+# code line.
+#
+# Both happen at the one place every message leaves through -- the bot's own
+# send_message, edit_message_text and answer_callback_query -- rather than at a
+# hundred call sites, each of which would be one more place to forget them.
+# Every message that ends in a known code is logged with its time, code and a
+# fresh incident id. The problems worth reporting also get a Report row beside
+# whatever buttons they already had, carrying that same incident, so a report
+# and its log line meet. The owner, about a Report button under "I don't
+# recognize that command": "not every command needs a report button. But keep
+# the report itself. Every exception should be logged inside the bot
+# automatically with time and id, but this one is simple." Which problems are
+# simple is problems.SIMPLE.
+#
+# A report sends nothing personal, and the disclaimer before it says exactly
+# what it does send. It is stored in the shared database and messaged to the
+# owner's account; if the owner has never started this bot, it is raised as a
+# warning event instead, which ManagerBot forwards.
+
+REPORTS_TO = int(os.environ.get("FAMILY_REPORTS_TO") or 8796896653)
+REPORT_BUTTONS = (os.environ.get("FAMILY_REPORT_BUTTONS") or "on").strip().lower() not in ("0", "off", "no", "false")
+
+_chat_langs: "OrderedDict[int, str]" = OrderedDict()
+
+
+def remember_chat_lang(chat_id, lang) -> None:
+    """The language a chat was last seen in, for labelling a report button on
+    a message that is already on its way out."""
+    if not chat_id or not lang:
+        return
+    _chat_langs[chat_id] = lang
+    _chat_langs.move_to_end(chat_id)
+    while len(_chat_langs) > 4096:
+        _chat_langs.popitem(last=False)
+
+
+def report_markup(lang: str, code: str, incident: str, markup=None):
+    """`markup` with a Report row added, or a keyboard holding only that row.
+    Left as it is for a problem too simple to need one (problems.SIMPLE), with
+    the buttons switched off, and for a keyboard that already has one or is a
+    reply keyboard."""
+    if (not REPORT_BUTTONS or not problems.reportable(code) or _has_report(markup)
+            or (markup is not None and not isinstance(markup, InlineKeyboardMarkup))):
+        return markup
+    rows = [list(row) for row in markup.inline_keyboard] if markup is not None else []
+    rows.append([InlineKeyboardButton(i18n.t(lang, "report_button"),
+                                      callback_data=f"rpt:{code}:{incident}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _has_report(markup) -> bool:
+    return any((getattr(button, "callback_data", None) or "").startswith("rpt")
+               for row in getattr(markup, "inline_keyboard", None) or () for button in row)
+
+
+def _button_incident(markup) -> "str | None":
+    """The incident a Report button made elsewhere already carries -- a
+    conversion's ending, or a crash notice, whose incident is also in the
+    owner's alert or beside the traceback."""
+    for row in getattr(markup, "inline_keyboard", None) or ():
+        for button in row:
+            data = getattr(button, "callback_data", None) or ""
+            if data.startswith("rpt:"):
+                return data.rsplit(":", 1)[-1]
+    return None
+
+
+# Every problem shown, one line each: when (the log line's own time), which
+# code, which incident, and whether it offered a Report button. Nothing about
+# who it happened to. Into bot.log with everything else, into problems.log of
+# its own wherever the bot writes log files, and into the lines ManagerBot's
+# /problemlog reads either way (family_link.keep_recent_log_lines).
+problem_log = logging.getLogger("problems")
+
+# One incident per occurrence. A message redrawn with the same problem still on
+# it -- a status line refreshed, a menu re-rendered -- keeps the incident it was
+# first shown with, so it is logged once and a Report button on it still
+# matches.
+_incidents: "OrderedDict[tuple, str]" = OrderedDict()
+
+
+def _remember_incident(chat_id, message_id, code: str, incident: str) -> None:
+    if chat_id is None or message_id is None:
+        return
+    key = (chat_id, message_id, code)
+    _incidents[key] = incident
+    _incidents.move_to_end(key)
+    while len(_incidents) > 4096:
+        _incidents.popitem(last=False)
+
+
+async def note_problem(chat_id, message_id, text, kwargs: dict):
+    """A message on its way out. If it ends in a problem code: log it, with a
+    new incident or the one this message already had, and give it a Report
+    button if the problem deserves one. Returns (code, incident), or
+    (None, None) for a message with no code."""
+    code = problems.find_code(text) if isinstance(text, str) else None
+    if not code:
+        return None, None
+    markup = kwargs.get("reply_markup")
+    made = _button_incident(markup)
+    known = _incidents.get((chat_id, message_id, code)) if message_id is not None else None
+    incident = made or known or problems.new_incident()
+    if (made is None and REPORT_BUTTONS and problems.reportable(code)
+            and (markup is None or isinstance(markup, InlineKeyboardMarkup))):
+        lang = _chat_langs.get(chat_id)
+        if lang is None and isinstance(chat_id, int):
+            try:
+                lang = await asyncio.to_thread(db.get_user_language, chat_id)
+            except Exception:
+                lang = None
+            remember_chat_lang(chat_id, lang)
+        try:
+            kwargs["reply_markup"] = report_markup(lang or "en", code, incident, markup)
+        except Exception:
+            logging.getLogger(__name__).debug("Could not add a report button", exc_info=True)
+    if incident != known:
+        problem_log.info("%s incident %s, %s", code, incident,
+                         "with a Report button" if _has_report(kwargs.get("reply_markup"))
+                         else "no Report button")
+    _remember_incident(chat_id, message_id, code, incident)
+    return code, incident
+
+
+def _log_problems_to_file() -> None:
+    """problems.log beside bot.log, wherever setup_logging() writes files."""
+    if any(isinstance(handler, RotatingFileHandler) for handler in problem_log.handlers):
+        return
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, RotatingFileHandler):
+            problem_file = RotatingFileHandler(
+                os.path.join(os.path.dirname(handler.baseFilename), "problems.log"),
+                maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+            problem_file.setFormatter(handler.formatter)
+            problem_log.addHandler(problem_file)
+            return
+
+
+def attach_problem_reports(application) -> None:
+    """Log every problem this bot shows, and put a Report button under the ones
+    that deserve it. Call once in main(), after the application is built.
+
+    Done by giving the bot object a subclass of its own class whose send, edit
+    and pop-up methods look at the text and hand over. python-telegram-bot
+    objects refuse ordinary attribute assignment once built, so the class is
+    swapped with object.__setattr__; if that is ever refused the codes still
+    show, and the log says the logging and the buttons are off."""
+    _log_problems_to_file()
+    bot = getattr(application, "bot", None)
+    base = type(bot)
+    if bot is None or getattr(base, "_reports_problems", False) or not hasattr(base, "send_message"):
+        return
+
+    async def send_message(self, chat_id, text, *args, **kwargs):
+        code, incident = await note_problem(chat_id, None, text, kwargs)
+        sent = await base.send_message(self, chat_id, text, *args, **kwargs)
+        if code:
+            _remember_incident(chat_id, getattr(sent, "message_id", None), code, incident)
+        return sent
+
+    async def edit_message_text(self, text, *args, **kwargs):
+        chat_id = kwargs.get("chat_id", args[0] if args else None)
+        message_id = kwargs.get("message_id", args[1] if len(args) > 1 else None)
+        await note_problem(chat_id, message_id, text, kwargs)
+        return await base.edit_message_text(self, text, *args, **kwargs)
+
+    async def answer_callback_query(self, callback_query_id, *args, **kwargs):
+        # A pop-up cannot hold a button, but it is a problem shown all the same.
+        text = kwargs.get("text", args[0] if args else None)
+        code = problems.find_code(text) if isinstance(text, str) else None
+        if code:
+            problem_log.info("%s incident %s, a pop-up", code, problems.new_incident())
+        return await base.answer_callback_query(self, callback_query_id, *args, **kwargs)
+
+    reporting = type(base.__name__, (base,), {
+        "__slots__": (), "__module__": base.__module__, "_reports_problems": True,
+        "send_message": send_message, "edit_message_text": edit_message_text,
+        "answer_callback_query": answer_callback_query,
+    })
+    try:
+        object.__setattr__(bot, "__class__", reporting)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Problem logging and Report buttons are off: this bot's send methods could not be wrapped",
+            exc_info=True)
+
+
+async def _send_report_to_owner(bot, code: str, incident: str, occurred_at) -> None:
+    label = os.environ.get("FAMILY_LABEL") or getattr(family_link, "_display_name", None) \
+        or family_link._bot_id or "a bot"
+    text = (f"🐞 Problem report from {label}\n"
+            f"Incident {incident} · happened {occurred_at:%Y-%m-%d %H:%M} UTC · version {family_link.VERSION}\n\n"
+            + problems.decode(code))
+    try:
+        await bot.send_message(chat_id=REPORTS_TO, text=text)
+        return
+    except Exception:
+        logging.getLogger(__name__).info("Could not message problem report %s directly", incident, exc_info=True)
+    emit_event("warning", "report", text)
+
+
+async def problem_report_callback(update, context) -> None:
+    """Report -> what a report sends, with Send and Cancel -> sent, or not."""
+    query = update.callback_query
+    user = update.effective_user
+    lang = await i18n.get_lang(user.id, context)
+    parts = (query.data or "").split(":")
+    action = parts[0]
+    if action == "rptc":
+        await query.answer()
+        await live_message.edit_in_place(query.message, context.bot, i18n.t(lang, "report_cancelled"))
+        return
+    code = parts[1] if len(parts) > 1 else ""
+    incident = parts[2] if len(parts) > 2 else ""
+    if action not in ("rpt", "rpts") or not problems.is_code(code) or not problems.is_incident(incident):
+        await query.answer(i18n.t(lang, "report_invalid"), show_alert=True)
+        return
+    await query.answer()
+    if action == "rpt":
+        # When the message with the problem was sent. A message too old for
+        # Telegram to hand back has a date of 1970, which is no use to anyone.
+        when = getattr(query.message, "date", None)
+        if when is None or when.timestamp() <= 0:
+            when = datetime.now(timezone.utc)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(i18n.t(lang, "report_send"),
+                                 callback_data=f"rpts:{code}:{incident}:{int(when.timestamp())}"),
+            InlineKeyboardButton(i18n.t(lang, "report_cancel"), callback_data="rptc"),
+        ]])
+        # Into the chat the button was in, so it works in a group as well as
+        # in private; nothing in it is personal.
+        chat = getattr(query.message, "chat", None)
+        await context.bot.send_message(
+            chat_id=getattr(chat, "id", None) or user.id, reply_markup=keyboard,
+            text=i18n.t(lang, "report_disclaimer", code=code, incident=incident))
+        return
+    stamp = parts[3] if len(parts) > 3 else ""
+    occurred_at = (datetime.fromtimestamp(int(stamp), tz=timezone.utc) if stamp.isdigit()
+                   else datetime.now(timezone.utc))
+    try:
+        new = await asyncio.to_thread(family_link.record_problem_report, code, incident, occurred_at)
+    except Exception:
+        logging.getLogger(__name__).exception("Could not store problem report %s (%s)", incident, code)
+        await live_message.edit_in_place(query.message, context.bot, i18n.t(lang, "report_failed"))
+        return
+    if new:
+        await _send_report_to_owner(context.bot, code, incident, occurred_at)
+    await live_message.edit_in_place(query.message, context.bot,
+                                     i18n.t(lang, "report_sent" if new else "report_already"))
+
+
+async def _tell_about_crash(update, context, incident: str) -> None:
+    """A crash used to leave the person with no answer at all. Now they are
+    told it failed on the bot's side, with a code and a report button whose
+    incident is the one logged beside the traceback."""
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
+    if chat is None or user is None or getattr(chat, "type", "") != "private":
+        return
+    try:
+        lang = await i18n.get_lang(user.id, context)
+    except Exception:
+        lang = "en"
+    try:
+        await context.bot.send_message(chat_id=chat.id, text=i18n.t(lang, "crash_notice"),
+                                       reply_markup=report_markup(lang, "FM-CRASH", incident))
+    except Exception:
+        logging.getLogger(__name__).debug("Could not tell anyone about crash %s", incident, exc_info=True)
+
+
 async def error_handler(update, context) -> None:
     """Register with Application.add_error_handler in each bot's main() --
     this is PTB's global hook for exceptions that escape a handler callback
@@ -1667,11 +2302,19 @@ async def error_handler(update, context) -> None:
 
     A dropped long poll reaches here too, and is not a crash -- see
     is_transient_network_error above."""
-    if is_transient_network_error(context.error):
+    # Only a failure with no update behind it is the long poll. A network
+    # error raised while handling somebody's message means that person asked
+    # for something and did not get it, and that is not a blip however
+    # transient its cause: it is counted, logged with its traceback, and
+    # reported like any other failure.
+    if update is None and is_transient_network_error(context.error):
         note_network_blip(context.error)
         return
-    logging.getLogger(__name__).error("Unhandled exception while processing an update", exc_info=context.error)
+    incident = problems.new_incident()
+    logging.getLogger(__name__).error(
+        "Unhandled exception while processing an update (incident %s)", incident, exc_info=context.error)
     record_error(context.error)
+    await _tell_about_crash(update, context, incident)
 
 
 # ---------------------------------------------------------------------------
@@ -1743,6 +2386,23 @@ async def track_activity(update, context) -> None:
     _activity_buffer.add(user.id)
     note_usage_update(user.id)
     context.user_data["_last_seen"] = time.time()
+    remember_chat_lang(user.id, context.user_data.get("lang"))
+
+    # A per-chat menu is frozen when it is set; see refresh_chat_menu. Only
+    # people who have one are checked, and the signature is updated before the
+    # call goes out, so a burst of updates schedules it once.
+    have = context.user_data.get(MENU_SIGNATURE_KEY)
+    if have:
+        try:
+            lang = context.user_data.get("lang")
+            commands = _menu_for(user.id, lang)
+            if commands:
+                expected = _menu_signature(commands)
+                if have != expected:
+                    context.user_data[MENU_SIGNATURE_KEY] = expected
+                    context.application.create_task(refresh_chat_menu(context, user.id, lang))
+        except Exception:
+            logging.getLogger(__name__).debug("Could not check the chat menu", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1755,7 +2415,7 @@ async def track_activity(update, context) -> None:
 #   there is nothing to arrange -- "send it again in a moment" is the whole
 #   truth, and lifecycle.busy() covers anyone already inside a job.
 #
-#   The owner has announced an update from ParentBot. That can last across
+#   The owner has announced an update from ManagerBot. That can last across
 #   several deploys, so the honest answer carries an estimate and a promise:
 #   the person is written down, and /finishupdates goes back to them when it
 #   is over. Being told "try again in a moment" and finding it still shut

@@ -39,6 +39,7 @@ Env vars: DBOT_TOKEN, DBOT_USERNAME (no @), DBOT_ADMIN_ID (optional,
 import asyncio
 import logging
 import os
+import shutil
 import uuid
 import time
 from contextlib import asynccontextmanager
@@ -76,6 +77,7 @@ from telegram.ext import (
 import cards
 import family_link
 import i18n
+import problems
 import lifecycle
 import net
 import platforms
@@ -100,11 +102,15 @@ from shared_features import (
     note_job,
     publish_profile,
     publish_commands,
+    refresh_chat_menu,
     ERASE_PREFIX,
     delete_my_data_chosen,
     delete_my_data_command,
     privacy_command,
     terms_command,
+    paysupport_command,
+    attach_problem_reports,
+    problem_report_callback,
     refuse_new_work,
     attach_flood_gate,
     attach_maintenance,
@@ -124,6 +130,7 @@ from shared_features import (
     sibling_bots_blurb,
     sibling_bots_keyboard_row,
     maybe_donation_nudge,
+    balance_command,
     donate_command,
     donate_amount_chosen,
     donate_fiat_amount_chosen,
@@ -186,10 +193,10 @@ POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
 # one, that is the OOM kill that ARCHITECTURE.md gives as the reason this bot
 # runs in a container of its own.
 #
-# Two at a time keeps the box responsive and costs a busy user a few seconds
-# of queueing, which the "Downloading..." message already accounts for. The
+# Three at a time -- two at most for any one person, see MAX_PER_USER below --
+# keeps the box responsive and costs a busy user a few seconds of queueing, which the "Downloading..." message already accounts for. The
 # semaphore is created lazily because it must belong to the running loop.
-MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("DBOT_MAX_CONCURRENT_DOWNLOADS", "2"))
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("DBOT_MAX_CONCURRENT_DOWNLOADS", "3"))
 
 _download_slots: asyncio.Semaphore | None = None
 
@@ -201,30 +208,87 @@ def _slots() -> asyncio.Semaphore:
     return _download_slots
 
 
-# ...and no more than one of those slots to any one person. Two global slots
-# is a limit on the box; it is not a share of the box, and one person pasting
-# two links at once takes both of them and leaves everyone else queueing
-# behind a stranger. One each means the second slot is always there for the
-# next person to arrive. It costs the heavy user nothing but sequence: their
-# second link starts when their first finishes, which is what the
-# "Downloading..." message already implies.
-_user_slots: "dict[int, asyncio.Lock]" = {}
+# ...and no more than MAX_PER_USER of them to any one person.
+#
+# This was one each, behind a Lock, and it was never the thing that made
+# somebody wait. Every bot in the family has python-telegram-bot process
+# updates one at a time, and handle_link ran the whole download before it
+# returned -- so a second link was not even read until the first had been
+# fetched, muxed and uploaded, and nor was anybody else's. The per-person
+# lock only ever guarded a queue that could not form.
+#
+# Each link is now its own task (see _spawn_download), so the handler returns
+# at once and the limits below are what actually decide. Three slots for the
+# box, two for any one person: somebody pasting a batch gets two moving at
+# once, and the third slot is always there for the next person to arrive.
+MAX_PER_USER = max(1, int(os.environ.get("DBOT_MAX_PER_USER") or 2))
+
+# Links one person may have waiting or in flight before a new one is refused.
+# Past that it is a backlog rather than a queue, and each waiting link is a
+# status message sitting in their chat saying nothing is happening.
+MAX_PENDING_PER_USER = max(1, int(os.environ.get("DBOT_MAX_PENDING_PER_USER") or 5))
+
+# The temporary storage limit is the product of two numbers already here:
+# every download holds at most DBOT_MAX_DOWNLOAD_MB on disk (video.py's
+# ceiling, 48 MB by default), and only MAX_CONCURRENT_DOWNLOADS hold one at a
+# time -- a link waiting for a slot has written nothing. So the work directory
+# never holds more than about 3 x 48 = 144 MB, however many links arrive.
+# What that cannot know is whether the disk has that much left, so a
+# download also refuses to start with less than MIN_FREE_MB free.
+MIN_FREE_MB = int(os.environ.get("DBOT_MIN_FREE_MB") or 300)
+
+_user_slots: "dict[int, asyncio.Semaphore]" = {}
+_user_pending: "dict[int, int]" = {}
 
 
 @asynccontextmanager
 async def _user_slot(user_id: int):
-    lock = _user_slots.get(user_id)
-    if lock is None:
-        lock = _user_slots[user_id] = asyncio.Lock()
+    slot = _user_slots.get(user_id)
+    if slot is None:
+        slot = _user_slots[user_id] = asyncio.Semaphore(MAX_PER_USER)
     try:
-        async with lock:
+        async with slot:
             yield
     finally:
         # Dropped as soon as it is idle: one dict entry per person who has
-        # ever pasted a link is a slow leak on a process that runs for
-        # months, and re-creating a Lock costs nothing.
-        if not lock.locked() and not lock._waiters:  # noqa: SLF001 - no public API for this
+        # ever pasted a link is a slow leak on a process that runs for months.
+        if slot._value >= MAX_PER_USER and not slot._waiters:  # noqa: SLF001 - no public API
             _user_slots.pop(user_id, None)
+
+
+def _user_slots_full(user_id: int) -> bool:
+    slot = _user_slots.get(user_id)
+    return slot is not None and slot.locked()
+
+
+def _free_mb() -> "int | None":
+    try:
+        return shutil.disk_usage(resolvers._WORK_DIR).free // (1024 * 1024)  # noqa: SLF001
+    except OSError:
+        return None
+
+
+def _spawn_download(context, update, work) -> None:
+    """Run one link's whole download in a task of its own.
+
+    `work` is a coroutine function. The update travels with the task so that
+    anything escaping it reaches the error handler attributed to the person
+    it happened to -- which, since the handler stopped filing network errors
+    with an update as blips, means it is reported rather than swallowed."""
+    user_id = update.effective_user.id
+    _user_pending[user_id] = _user_pending.get(user_id, 0) + 1
+
+    async def run():
+        try:
+            await work()
+        finally:
+            left = _user_pending.get(user_id, 1) - 1
+            if left > 0:
+                _user_pending[user_id] = left
+            else:
+                _user_pending.pop(user_id, None)
+
+    context.application.create_task(run(), update=update)
 
 
 def build_help_text(lang: str) -> str:
@@ -242,7 +306,9 @@ BOT_COMMANDS = [
     BotCommand("caption", "Toggle the credit caption on downloads"),
     BotCommand("lossless", "Send downloads as uncompressed files"),
     BotCommand("cancel", "Stop whatever I'm waiting for"),
-    BotCommand("donate", "Chip in for hosting costs"),
+    BotCommand("balance", "Your credit balance"),
+    BotCommand("donate", "Contribute to hosting costs"),
+    BotCommand("paysupport", "Help with a payment"),
     BotCommand("language", "Choose your language / Tilni tanlash / Выбрать язык"),
     BotCommand("en", "Switch to English"),
     BotCommand("uz", "O'zbekchaga o'tish"),
@@ -390,6 +456,9 @@ async def _apply_language(update: Update, context: ContextTypes.DEFAULT_TYPE, la
     instructions, printed in the language just chosen."""
     await asyncio.to_thread(set_user_language, update.effective_user.id, lang)
     context.user_data["lang"] = lang
+    # The menu follows the choice too -- Telegram otherwise shows it in the
+    # language of the phone.
+    await refresh_chat_menu(context, update.effective_user.id, lang)
     await _continue_start(update, context, lang)
 
 
@@ -587,7 +656,7 @@ async def _flush_provider_health(_context=None) -> None:
 
 
 # How long one route gets during a bus probe. Shorter than a real download's
-# PROVIDER_TIMEOUT, because ParentBot calls a family command failed after 90
+# PROVIDER_TIMEOUT, because ManagerBot calls a family command failed after 90
 # seconds and a probe nobody can run from their phone is not worth having.
 PROBE_TIMEOUT_S = float(os.environ.get("DBOT_PROBE_TIMEOUT", "12"))
 
@@ -645,10 +714,10 @@ async def providers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _bus_providers(context, args):
-    """The same report, asked for from ParentBot (`/providers downloader`).
+    """The same report, asked for from ManagerBot (`/providers downloader`).
 
     Every owner-only command in this family should be reachable from
-    ParentBot, and this one was not -- which mattered more than most, because
+    ManagerBot, and this one was not -- which mattered more than most, because
     the question it answers ("which route is broken right now") is one you
     ask when something is already wrong and you are not sitting in this bot's
     chat.
@@ -773,10 +842,14 @@ async def redeliver_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text(_allowance_message(lang, allowance))
         return
     await asyncio.to_thread(record_download, update.effective_user.id, remembered["platform"])
-    await _resolve_and_send(
-        update, context, remembered["platform"], remembered["url"],
-        lossless_override=not remembered["lossless"],
-    )
+
+    async def work():
+        await _resolve_and_send(
+            update, context, remembered["platform"], remembered["url"],
+            lossless_override=not remembered["lossless"],
+        )
+
+    _spawn_download(context, update, work)
 
 
 async def _after_send(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
@@ -957,12 +1030,16 @@ async def _resolve_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     # Say so rather than leaving them watching a "Fetching..." that has not
     # actually started yet.
-    if _slots().locked():
+    if _slots().locked() or _user_slots_full(update.effective_user.id):
         await status.set(context.bot, i18n.t(lang, "queued"))
 
     paths: list[str] = []
     async with _user_slot(update.effective_user.id), _slots(), lifecycle.busy(
             update.effective_chat.id, i18n.t(lang, "restarting_send_again")):
+        free = _free_mb()
+        if free is not None and free < MIN_FREE_MB:
+            await status.set(context.bot, i18n.t(lang, "download_short_on_space"))
+            return False
         try:
             resolved = await resolvers.resolve(platform, url)
         except resolvers.NothingWorked as exc:
@@ -1127,7 +1204,7 @@ def _allowance_message(lang: str, allowance: dict) -> str:
                   minutes=allowance["wait_min"])
     if not allowance["donor"]:
         text += "\n\n" + i18n.t(lang, "quota_donor_hint")
-    return text
+    return text + problems.code_line("DL-QUOTA-HOUR" if allowance["scope"] == "hour" else "DL-QUOTA-DAY")
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1158,18 +1235,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # of the three branches below, because the Reddit and Twitter paths cost
     # the same fetches and used to be the way past a limit that only the
     # video path enforced.
+    # Checked before the allowance, so a link refused for being one too many
+    # does not also count against the day's share.
+    if _user_pending.get(update.effective_user.id, 0) >= MAX_PENDING_PER_USER:
+        await update.message.reply_text(
+            i18n.t(lang, "download_queue_full", count=MAX_PENDING_PER_USER))
+        return
     allowance = await asyncio.to_thread(download_allowance, update.effective_user.id)
     if not allowance["allowed"]:
         await update.message.reply_text(_allowance_message(lang, allowance))
         return
     await asyncio.to_thread(record_download, update.effective_user.id, platform)
 
-    if platform == "reddit":
-        await _handle_reddit(update, context, url)
-    elif platform == "twitter":
-        await _handle_twitter(update, context, url)
-    else:
-        await _resolve_and_send(update, context, platform, url)
+    async def work():
+        if platform == "reddit":
+            await _handle_reddit(update, context, url)
+        elif platform == "twitter":
+            await _handle_twitter(update, context, url)
+        else:
+            await _resolve_and_send(update, context, platform, url)
+
+    # Returns straight away: the next link, and everybody else's, is read now
+    # rather than after this one has finished uploading.
+    _spawn_download(context, update, work)
 
 
 async def unrecognized_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1237,6 +1325,7 @@ def main():
     app = builder.build()
     lifecycle.install(app, BOT_NAME)
     app.add_error_handler(error_handler)
+    attach_problem_reports(app)
     # ---- the handlers that run before everything else ----
     # ONE GROUP EACH, and that is the whole point. python-telegram-bot runs
     # at most ONE handler per group: the first whose filter matches wins and
@@ -1280,11 +1369,14 @@ def main():
     # finish whatever they were doing first. ----
     app.add_handler(CommandHandler("privacy", privacy_command))
     app.add_handler(CommandHandler("terms", terms_command))
+    app.add_handler(CommandHandler("paysupport", paysupport_command))
+    app.add_handler(CallbackQueryHandler(problem_report_callback, pattern=r"^rpt"))
     app.add_handler(CommandHandler("deletemydata", delete_my_data_command))
     app.add_handler(CallbackQueryHandler(delete_my_data_chosen, pattern="^" + ERASE_PREFIX))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(platforms.ANY_LINK_RE), handle_link))
 
     # ---- donations (Telegram Stars) -- this bot's only Stars usage ----
+    app.add_handler(CommandHandler("balance", balance_command))
     app.add_handler(CommandHandler("donate", donate_command))
     app.add_handler(CallbackQueryHandler(donate_amount_chosen, pattern="^donate:"))
     app.add_handler(CallbackQueryHandler(donate_fiat_amount_chosen, pattern="^donatefiat:"))
@@ -1296,7 +1388,7 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unrecognized_message))
 
-    # ParentBot's link: heartbeats, crash/donation events, and the queue it
+    # ManagerBot's link: heartbeats, crash/donation events, and the queue it
     # uses to run this bot's owner-only commands remotely. Never raises --
     # with no shared database reachable the bot just runs on its own.
     family_link.attach(app, BOT_NAME, "DownloaderBot", START_TIME)

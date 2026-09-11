@@ -123,9 +123,15 @@ class ProviderFailed(Exception):
     (the post looks gone or private), "too_big", or "error".
     """
 
-    def __init__(self, message: str, kind: str = "error"):
+    def __init__(self, message: str, kind: str = "error", skip=()):
         super().__init__(message)
         self.kind = kind
+        # Providers that cannot help once this one has failed this way. A
+        # provider that learns the answer is "a video" knows the page scraper
+        # behind it would reply with a picture of that video, and a provider
+        # that succeeds ends the chain -- so it has to be able to say "not
+        # that one" rather than merely "not me".
+        self.skip = tuple(skip)
 
 
 class NothingWorked(Exception):
@@ -601,7 +607,14 @@ async def _pin_api(url: str) -> Resolved:
         raise ProviderFailed("pinterest returned no pin", "missing")
 
     items: list[MediaItem] = []
-    video = _pin_best_video((data.get("videos") or {}).get("video_list"))
+    # Whether the pin is a video at all, whatever Pinterest serves it as. A
+    # pin can carry a video_list with no mp4 in it -- only an HLS manifest,
+    # V_HLSV3_MOBILE -- and _pin_best_video rightly refuses a manifest. What
+    # it must not then do is describe the pin with `images`, which is its
+    # cover frame: that is how a friend's shared video came back as a still.
+    top_list = (data.get("videos") or {}).get("video_list")
+    saw_video = bool(top_list)
+    video = _pin_best_video(top_list)
     if video:
         items.append(MediaItem("video", url=video, filename="pinterest.mp4"))
 
@@ -609,10 +622,20 @@ async def _pin_api(url: str) -> Resolved:
     # separate file, in order, the same way a carousel is.
     for page in ((data.get("story_pin_data") or {}).get("pages") or []):
         for block in (page.get("blocks") or []):
-            block_video = _pin_best_video((block.get("video") or {}).get("video_list"))
+            block_list = (block.get("video") or {}).get("video_list")
+            saw_video = saw_video or bool(block_list)
+            block_video = _pin_best_video(block_list)
             if block_video:
                 items.append(MediaItem("video", url=block_video,
                                        filename=f"pinterest_{len(items) + 1}.mp4"))
+
+    if not items and saw_video:
+        # yt-dlp fetches HLS and muxes it, which is what it is for. The page
+        # scraper would only find the same cover frame in og:image and end
+        # the chain with it, so it is ruled out rather than tried.
+        raise ProviderFailed(
+            "that pin is a video Pinterest serves only as a stream, which this route cannot fetch",
+            "error", skip=("pinterest_og",))
 
     if not items:
         # A photo pin, or a kind this does not know. `orig` is the full-size
@@ -752,7 +775,11 @@ async def resolve(platform: str, url: str) -> Resolved:
     if not chain:
         raise NothingWorked(platform, {})
 
+    skipped: set[str] = set()
     for name, fn in chain:
+        if name in skipped:
+            logger.info("provider %s skipped for %s: an earlier route ruled it out", name, platform)
+            continue
         started = time.perf_counter()
         try:
             resolved = await asyncio.wait_for(fn(url), timeout=PROVIDER_TIMEOUT_S)
@@ -760,6 +787,7 @@ async def resolve(platform: str, url: str) -> Resolved:
                 raise ProviderFailed("returned nothing", "missing")
         except ProviderFailed as exc:
             failures[name] = exc
+            skipped.update(exc.skip)
             _record_fail(name, str(exc))
             logger.info("provider %s failed for %s: %s", name, platform, exc)
         except asyncio.TimeoutError:
@@ -870,7 +898,7 @@ async def probe_all(urls: dict[str, str] | None = None, fetch: bool = False,
     Platforms run concurrently and the routes within one run in order, so the
     whole thing costs about as long as the slowest single chain rather than
     the sum of all of them. That matters because this is reachable over the
-    family bus, where ParentBot gives a command 90 seconds before calling it
+    family bus, where ManagerBot gives a command 90 seconds before calling it
     a timeout -- and a probe that cannot finish inside that window is a probe
     nobody can run from their phone.
     """

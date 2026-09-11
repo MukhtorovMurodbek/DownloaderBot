@@ -6,12 +6,9 @@ Reddit or X and sends back the media behind it.
 Using it means accepting what follows. The short version is available inside
 the bot as `/terms`, in English, Uzbek and Russian.
 
-**Operator:** _to be completed before this file is published — the name and a
-contact address for whoever runs this deployment. The same value goes in the
-`OPERATOR_CONTACT` environment variable, which is what the in-bot `/privacy`
-and `/terms` print._
+**Operator contact:** mukhtorovmurodbek@gmail.com
 
-_Last reviewed: 7 September 2026._
+_Last reviewed: 10 September 2026._
 
 ---
 
@@ -45,10 +42,35 @@ means, is grounds for being blocked.
 
 ## Money
 
-`/donate` is voluntary. It buys nothing, unlocks nothing, and grants no
-priority; it goes towards what the bot costs to run. Every payment is
-processed by Telegram, which means the bot never sees a card number and never
-holds one. A donation sent by mistake is returned on request.
+`/donate` is voluntary, and it goes towards what the family's bots cost to
+run. A payment in Telegram Stars also adds **⚡ credit** to a balance shared by
+all four bots. Credit pays for conversions in ConvertBot, and `/balance` shows
+the balance and everything it was spent on.
+
+How much credit a payment adds depends on how many Stars you have paid in
+total, over every payment in every bot. The ordinary rate is two ⚡ for each
+Star. The first 500 Stars you ever pay earn three times that, six ⚡ each; the
+next 500 earn twice that, four ⚡ each; after 1,000 Stars each one earns the
+ordinary two. Paying in several small amounts earns exactly what paying once
+would. The bot says what your next Stars earn before you pay.
+
+**The part above the ordinary rate is bonus credit, and it expires 90 days
+after the payment that earned it.** Ordinary credit does not expire.
+Conversions use bonus credit first, the soonest to expire first, so what
+expires is only bonus that went unused. `/balance` shows how much of your
+balance is bonus and when the next of it runs out.
+
+**Payments are final. Stars are not refunded, and credit is not money and it
+is not Stars: it cannot be withdrawn, turned back into Stars, or
+transferred.** Every bot says so in `/help`, and ConvertBot again before a paid
+conversion.
+
+If a payment went wrong — charged with no credit to show for it, or charged
+twice — `/paysupport` says how to reach the operator, and it is put right
+with credit.
+
+Every payment is processed by Telegram, which means the bot never sees a card
+number and never holds one.
 
 ## Availability
 

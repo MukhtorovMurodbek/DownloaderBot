@@ -727,7 +727,7 @@ def record_download(user_id: int, platform: str | None = None) -> None:
 
 # ---------- housekeeping ----------
 # activity_events is append-only and powers nothing older than the retention
-# window below (/status counts the last hour and since-start, ParentBot's
+# window below (/status counts the last hour and since-start, ManagerBot's
 # /users the last N hours). Left alone it is the one table in this schema that
 # grows without limit, which on a metered database is a bill that only ever
 # goes up. family_link.py's housekeeping job calls this.

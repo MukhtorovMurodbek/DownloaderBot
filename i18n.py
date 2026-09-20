@@ -84,13 +84,14 @@ STRINGS = {
         "topup_thanks_bonus": 'Of that, {bonus} ⚡ is bonus credit and expires on {date}.',
         "credit_cannot_be_withdrawn": '⚡ is credit for conversions in ConvertBot, and can NOT be withdrawn or turned back into Stars. A problem with a payment? /paysupport',
         "paysupport_text": '💳 Help with a payment\n\nPayments are FINAL: Stars are NOT refunded, and ⚡ credit can NOT be withdrawn or turned back into Stars.\n\nIf a payment went wrong — you were charged and no credit arrived, or you were charged twice — write to {contact} with the date, the amount and your Telegram id, {user_id}. It will be checked and put right with credit.\n\n/balance lists every payment and what it added.',
-        "report_button": '🐞 Report the issue',
-        "report_disclaimer": "📨 Send a report about this problem to the bot's owner?\n\nWhat is sent: the bot's name, the error code {code}, the incident number {incident}, when it happened and the bot's version.\n\nNo personal info is sent.",
-        "report_send": '📨 Send report',
+        "report_button": '🐞 Add my details',
+        "problem_logged_note": "This is already written down for the bot's owner — the code, the time and the version, and nothing about you.",
+        "report_disclaimer": "📨 Add your own details to this problem?\n\nAlready recorded, with you left out of it: the bot's name, the error code {code}, the incident number {incident}, when it happened and the bot's version.\n\nTapping Send adds four things: your Telegram user ID, your @username if you have one, the language you picked, and whether this chat is private or a group. Not what you wrote, and not the file you sent.\n\nIt lets your case be found in the logs, which is usually what makes a rare problem fixable. Entirely your choice.",
+        "report_send": '📨 Send my details',
         "report_cancel": '✖️ Cancel',
-        "report_sent": '✅ Report sent — thank you. It helps get this fixed.',
-        "report_already": 'This report has already been sent.',
-        "report_cancelled": 'Report cancelled — nothing was sent.',
+        "report_sent": '✅ Thank you — your details are on incident {incident} now, which is what makes this one findable.',
+        "report_already": 'Your details are already on incident {incident}. Nothing more was sent.',
+        "report_cancelled": 'Cancelled — nothing about you was sent. The problem itself stays logged.',
         "report_failed": "⚠️ The report couldn't be sent right now. Please try again later.",
         "report_invalid": 'This button no longer works.',
         "crash_notice": "⚠️ Something went wrong on the bot's side while handling that, so it wasn't done. Please try again in a moment.",
@@ -128,6 +129,23 @@ STRINGS = {
             "• whatever the bot is in the middle of doing with you, until it is finished\n"
             "\n"
             "The media itself is not kept. It is fetched, sent to you, and deleted."
+        ),
+        "privacy_problems_heading": "When something goes wrong:",
+        "privacy_problems": (
+            "Every error this bot shows anybody is written down by itself: the error code, an "
+            "incident number, when it happened and the bot's version. Nothing in that is about "
+            "you — not your id, not your name, not what you sent. A fault nobody reports is "
+            "still a fault, which is why it does not wait to be asked.\n"
+            "\n"
+            "\"Add my details\" under an error offers to attach four things to that one "
+            "incident: your Telegram user id, your @username if you have one, the language you "
+            "picked, and whether the chat is private or a group. All four are named on screen "
+            "first, and nothing is sent unless you tap Send. What you wrote and the files you "
+            "sent are never part of it.\n"
+            "\n"
+            "Those four are cleared after 30 days on their own, and /deletemydata clears them "
+            "straight away. The record of the error stays — it still happened — it just stops "
+            "saying who hit it. The records themselves are deleted after 180 days."
         ),
         "privacy_seen_by_heading": "Who else sees it:",
         "privacy_seen_by": (
@@ -200,9 +218,10 @@ STRINGS = {
             "Hey! Send me a link (Instagram, TikTok, Pinterest, Reddit, or "
             "Twitter/X) and I'll grab it for you.\n\n"
         ),
-        "help_text": 'Paste a link any time and I\'ll grab it — no command needed:\n  - Instagram: reels, photos, whole carousels\n  - TikTok: videos without the watermark, and photo slideshows\n  - Twitter/X: video and photos, or a clean image card for a text post\n  - Pinterest: the pin, at full size\n  - Reddit: the media if it\'s a media post, or a card if it\'s text\n\nCommands:\n/caption on|off - toggle the "via @{username}" credit caption\n/lossless on|off - get downloads as uncompressed files\n/donate - chip in for hosting costs (totally optional)\n/cancel - stop something I\'m waiting on you for (I\'ll ask which)\n/en, /uz, /rus - switch language (or /language, which asks)\n\n⚠️ NOTE: Payments are final — Stars paid through /donate are NOT refunded, and the ⚡ credit they add can NOT be withdrawn.\n\n',
+        "help_text": 'Paste a link any time and I\'ll grab it — no command needed:\n  - Instagram: reels, photos, whole carousels\n  - TikTok: videos without the watermark, and photo slideshows\n  - Twitter/X: video and photos, or a clean image card for a text post\n  - Pinterest: the pin, at full size\n  - Reddit: the media if it\'s a media post, or a card if it\'s text\n\nCommands:\n/settings - the caption and the file quality, both on one screen\n/caption on|off - the "via @{username}" credit caption, on its own\n/lossless on|off - get downloads as uncompressed files\n/donate - chip in for hosting costs (totally optional)\n/cancel - stop something I\'m waiting on you for (I\'ll ask which)\n/en, /uz, /rus - switch language (or /language, which asks)\n\n⚠️ NOTE: Payments are final — Stars paid through /donate are NOT refunded, and the ⚡ credit they add can NOT be withdrawn.\n\n',
         "caption_state_on": "ON",
         "caption_state_off": "OFF",
+        "settings_heading": "⚙️ Your settings. Tap to change either one.",
         "caption_status": "Caption is currently {state}.",
         "caption_turned": "Download caption turned {state}.",
         "caption_toggle_answer": "Caption turned {state}.",
@@ -272,13 +291,14 @@ STRINGS = {
         "topup_thanks_bonus": 'Shundan {bonus} ⚡ — bonus kredit, uning muddati {date} kuni tugaydi.',
         "credit_cannot_be_withdrawn": "⚡ — ConvertBot'dagi konvertatsiyalar uchun kredit: uni yechib olib ham, Stars'ga aylantirib ham BO'LMAYDI. To'lovda muammo bo'lsa: /paysupport",
         "paysupport_text": "💳 To'lov bo'yicha yordam\n\nTo'lovlar QAYTARILMAYDI: Stars qaytarib berilmaydi, ⚡ kreditni esa yechib olib ham, Stars'ga aylantirib ham BO'LMAYDI.\n\nTo'lovda xatolik bo'lgan bo'lsa — pul yechilgan-u, kredit tushmagan bo'lsa yoki ikki marta yechilgan bo'lsa — {contact} manziliga to'lov sanasi, miqdori va Telegram ID raqamingizni ({user_id}) yozib yuboring. Tekshirilib, kredit bilan to'g'rilab beriladi.\n\n/balance har bir to'lovni va u qancha kredit qo'shganini ko'rsatadi.",
-        "report_button": '🐞 Muammo haqida xabar berish',
-        "report_disclaimer": "📨 Bu muammo haqida bot egasiga xabar yuborilsinmi?\n\nNima yuboriladi: bot nomi, {code} xato kodi, {incident} hodisa raqami, muammo qachon yuz bergani va bot versiyasi.\n\nHech qanday shaxsiy ma'lumot yuborilmaydi.",
-        "report_send": '📨 Yuborish',
+        "report_button": "🐞 Ma'lumotlarimni qo'shish",
+        "problem_logged_note": "Bu muammo bot egasi uchun allaqachon yozib olindi — kodi, vaqti va bot versiyasi. Siz haqingizda hech narsa yo'q.",
+        "report_disclaimer": "📨 Bu muammoga o'zingiz haqingizdagi ma'lumotni ham qo'shasizmi?\n\nSizsiz yozib olingani: bot nomi, {code} xato kodi, {incident} hodisa raqami, qachon yuz bergani va bot versiyasi.\n\n\"Yuborish\" tugmasi to'rt narsani qo'shadi: Telegram ID raqamingiz, bo'lsa @username'ingiz, siz tanlagan til va bu suhbat shaxsiymi yoki guruhmi. Yozganingiz ham, yuborgan faylingiz ham emas.\n\nShunda sizning holatingizni loglardan topib bo'ladi — kam uchraydigan muammoni odatda shu tuzatib beradi. To'liq o'zingiz hal qilasiz.",
+        "report_send": "📨 Ma'lumotlarimni yuborish",
         "report_cancel": '✖️ Bekor qilish',
-        "report_sent": '✅ Xabar yuborildi — rahmat! Bu muammoni tuzatishga yordam beradi.',
-        "report_already": 'Bu xabar allaqachon yuborilgan.',
-        "report_cancelled": 'Bekor qilindi — hech narsa yuborilmadi.',
+        "report_sent": "✅ Rahmat — ma'lumotlaringiz {incident} hodisasiga biriktirildi, endi uni topish oson.",
+        "report_already": "Ma'lumotlaringiz {incident} hodisasiga allaqachon biriktirilgan. Boshqa hech narsa yuborilmadi.",
+        "report_cancelled": "Bekor qilindi — siz haqingizda hech narsa yuborilmadi. Muammoning o'zi yozib olingan holicha qoladi.",
         "report_failed": "⚠️ Hozir xabarni yuborib bo'lmadi. Keyinroq qayta urinib ko'ring.",
         "report_invalid": 'Bu tugma endi ishlamaydi.',
         "crash_notice": "⚠️ Buni bajarishda bot tomonida xatolik yuz berdi, shuning uchun amal bajarilmadi. Birozdan keyin qayta urinib ko'ring.",
@@ -298,6 +318,8 @@ STRINGS = {
         "privacy_heading": "🔒 Maxfiylik",
         "privacy_kept_heading": "Bu bot nimalarni saqlaydi:",
         "privacy_stored": "• Telegram ID raqamingiz, tilingiz, izoh va sifat sozlamalaringiz\n• yuborgan havolangiz — undagi fayl olinguncha\n• har bir yuklab olish uchun bitta yozuv: qaysi platformadan va qachon; kunlik limit shu asosida hisoblanadi\n• botdan foydalangan vaqtingiz — bot egasi botdan umuman foydalanilayotganini bilishi uchun\n• xayriya qilsangiz, uning yozuvi: miqdori va Telegram to'lov raqami\n• bot siz uchun bajarayotgan ish — u tugagunicha\n\nFaylning o'zi saqlanmaydi: u olinadi, sizga yuboriladi va o'chiriladi.",
+        "privacy_problems_heading": "Nimadir noto'g'ri ketganda:",
+        "privacy_problems": "Bot kimgadir xato ko'rsatsa, uni o'zi yozib qo'yadi: xato kodi, hodisa raqami, qachon yuz bergani va bot versiyasi. Bularda siz haqingizda hech narsa yo'q — ID raqamingiz ham, ismingiz ham, nima yuborganingiz ham. Hech kim xabar bermagan nosozlik ham nosozligicha qoladi, shuning uchun bot so'ralishini kutmaydi.\n\nXato ostidagi \"Ma'lumotlarimni qo'shish\" tugmasi o'sha bitta hodisaga to'rt narsani biriktirishni taklif qiladi: Telegram ID raqamingiz, bo'lsa @username'ingiz, siz tanlagan til va bu suhbat shaxsiymi yoki guruhmi. To'rttasi ham avval ekranda aytiladi va \"Yuborish\"ni bosmasangiz hech narsa yuborilmaydi. Yozganlaringiz va yuborgan fayllaringiz esa bunga hech qachon kirmaydi.\n\nBu to'rttasi 30 kundan keyin o'z-o'zidan o'chiriladi, /deletemydata esa darhol o'chiradi. Xatolik yozuvining o'zi qoladi — u haqiqatan yuz bergan — shunchaki endi kim duch kelgani yozilmaydi. Yozuvlarning o'zi 180 kundan keyin o'chiriladi.",
         "privacy_seen_by_heading": "Yana kim ko'ra oladi:",
         "privacy_seen_by": "• Telegram — barcha xabarlar u orqali o'tadi va u o'z qoidalari asosida ishlaydi\n• bot joylashgan hosting va bot foydalanadigan ma'lumotlar bazasi",
         "privacy_others": "• siz havolasini yuborgan sayt, hamda sayt to'g'ridan-to'g'ri javob bermaganda bot murojaat qiladigan yuklab olish xizmatlari. Ular havolani oladi va so'rov sizdan emas, bot serveridan kelganini ko'radi; ular nimani qayd etishi o'z qoidalariga bog'liq, bu botning qoidalariga emas.",
@@ -333,9 +355,10 @@ STRINGS = {
             "Salom! Menga havola yuboring (Instagram, TikTok, Pinterest, Reddit "
             "yoki Twitter/X) va men uni siz uchun yuklab beraman.\n\n"
         ),
-        "help_text": 'Havola yuboring — faylni olib beraman, buyruq kerak emas:\n  - Instagram: reels, rasmlar, butun karusel\n  - TikTok: suv belgisiz video va rasm-slaydlar\n  - Twitter/X: video va rasmlar, matnli post uchun esa rasm-kartochka\n  - Pinterest: pin, asl o\'lchamda\n  - Reddit: media post bo\'lsa — media, matnli bo\'lsa — kartochka\n\nBuyruqlar:\n/caption on|off - fayllar ostidagi "via @{username}" yozuvini yoqish/o\'chirish\n/lossless on|off - fayllarni siqilmagan holda olish\n/donate - server xarajatlariga hissa qo\'shish (ixtiyoriy)\n/cancel - joriy amalni bekor qilish (bir nechta bo\'lsa, qaysi birini so\'rayman)\n/en, /uz, /rus - tilni almashtirish (yoki /language)\n\n⚠️ DIQQAT: To\'lovlar QAYTARILMAYDI — /donate orqali to\'langan Stars qaytarib berilmaydi, ular bergan ⚡ kreditni esa yechib olib BO\'LMAYDI.\n\n',
+        "help_text": 'Havola yuboring — faylni olib beraman, buyruq kerak emas:\n  - Instagram: reels, rasmlar, butun karusel\n  - TikTok: suv belgisiz video va rasm-slaydlar\n  - Twitter/X: video va rasmlar, matnli post uchun esa rasm-kartochka\n  - Pinterest: pin, asl o\'lchamda\n  - Reddit: media post bo\'lsa — media, matnli bo\'lsa — kartochka\n\nBuyruqlar:\n/settings - izoh va fayl sifati — ikkalasi bitta ekranda\n/caption on|off - fayllar ostidagi "via @{username}" yozuvini yoqish/o\'chirish\n/lossless on|off - fayllarni siqilmagan holda olish\n/donate - server xarajatlariga hissa qo\'shish (ixtiyoriy)\n/cancel - joriy amalni bekor qilish (bir nechta bo\'lsa, qaysi birini so\'rayman)\n/en, /uz, /rus - tilni almashtirish (yoki /language)\n\n⚠️ DIQQAT: To\'lovlar QAYTARILMAYDI — /donate orqali to\'langan Stars qaytarib berilmaydi, ular bergan ⚡ kreditni esa yechib olib BO\'LMAYDI.\n\n',
         "caption_state_on": "YONIQ",
         "caption_state_off": "O'CHIQ",
+        "settings_heading": "⚙️ Sozlamalaringiz. O'zgartirish uchun bosing.",
         "caption_status": "Izoh hozir {state}.",
         "caption_turned": 'Fayl izohi endi {state}.',
         "caption_toggle_answer": 'Izoh endi {state}.',
@@ -417,13 +440,14 @@ STRINGS = {
         "topup_thanks_bonus": 'Из них {bonus} ⚡ — бонусный кредит, он сгорит {date}.',
         "credit_cannot_be_withdrawn": '⚡ — это кредит на конвертации в ConvertBot, его НЕЛЬЗЯ вывести или обменять обратно на Stars. Проблема с платежом? /paysupport',
         "paysupport_text": '💳 Помощь с платежом\n\nПлатежи ОКОНЧАТЕЛЬНЫЕ: Stars НЕ возвращаются, а ⚡ кредит НЕЛЬЗЯ вывести или обменять обратно на Stars.\n\nЕсли с платежом что-то пошло не так — деньги списали, а кредит не пришёл, или списали дважды, — напишите на {contact}: дату, сумму и ваш Telegram ID, {user_id}. Это проверят и исправят кредитом.\n\n/balance показывает каждый платёж и что он добавил.',
-        "report_button": '🐞 Сообщить о проблеме',
-        "report_disclaimer": '📨 Отправить владельцу бота сообщение об этой проблеме?\n\nЧто отправится: название бота, код ошибки {code}, номер случая {incident}, когда это произошло, и версия бота.\n\nЛичные данные не отправляются.',
-        "report_send": '📨 Отправить',
+        "report_button": '🐞 Добавить мои данные',
+        "problem_logged_note": 'Эта проблема уже записана для владельца бота — код, время и версия. О вас там ничего нет.',
+        "report_disclaimer": '📨 Добавить к этой проблеме ваши данные?\n\nУже записано, без вас: название бота, код ошибки {code}, номер случая {incident}, когда это произошло и версия бота.\n\nКнопка «Отправить» добавит четыре вещи: ваш Telegram ID, ваш @username, если он есть, выбранный вами язык и то, личный это чат или группа. Ни того, что вы написали, ни отправленного файла.\n\nТогда ваш случай можно будет найти в логах — обычно именно это и позволяет починить редкую проблему. Решать только вам.',
+        "report_send": '📨 Отправить мои данные',
         "report_cancel": '✖️ Отмена',
-        "report_sent": '✅ Сообщение отправлено — спасибо! Это поможет всё исправить.',
-        "report_already": 'Это сообщение уже отправлено.',
-        "report_cancelled": 'Отменено — ничего не отправлено.',
+        "report_sent": '✅ Спасибо — ваши данные теперь на случае {incident}, так его легко найти.',
+        "report_already": 'Ваши данные уже на случае {incident}. Больше ничего не отправлено.',
+        "report_cancelled": 'Отменено — о вас ничего не отправлено. Сама проблема остаётся записанной.',
         "report_failed": '⚠️ Сейчас не удалось отправить сообщение. Попробуйте позже.',
         "report_invalid": 'Эта кнопка больше не работает.',
         "crash_notice": '⚠️ При обработке произошла ошибка на стороне бота, поэтому ничего не сделано. Попробуйте ещё раз чуть позже.',
@@ -462,6 +486,8 @@ STRINGS = {
             "\n"
             "Само видео или фото не хранится: бот его достаёт, отправляет тебе и удаляет."
         ),
+        "privacy_problems_heading": "Когда что-то ломается:",
+        "privacy_problems": "Каждую ошибку, которую бот кому-то показывает, он записывает сам: код ошибки, номер случая, когда это произошло и версию бота. О вас там нет ничего — ни вашего id, ни имени, ни того, что вы отправили. Сбой, о котором никто не сообщил, остаётся сбоем, поэтому бот не ждёт, пока его попросят.\n\nКнопка «Добавить мои данные» под ошибкой предлагает привязать к этому случаю четыре вещи: ваш Telegram id, ваш @username, если он есть, выбранный вами язык и то, личный это чат или группа. Все четыре сначала названы на экране, и ничего не отправляется, пока вы не нажмёте «Отправить». Того, что вы написали, и отправленных файлов там не бывает никогда.\n\nЭти четыре стираются сами через 30 дней, а /deletemydata стирает их сразу. Запись об ошибке остаётся — она действительно произошла — просто перестаёт говорить, кто на неё наткнулся. Сами записи удаляются через 180 дней.",
         "privacy_seen_by_heading": "Кто ещё это видит:",
         "privacy_seen_by": (
             "• Telegram — он передаёт каждое сообщение в обе стороны и действует по своим "
@@ -532,9 +558,10 @@ STRINGS = {
             "Привет! Пришли мне ссылку (Instagram, TikTok, Pinterest, Reddit "
             "или Twitter/X), и я скачаю это для тебя.\n\n"
         ),
-        "help_text": 'Просто пришли ссылку в любое время — я её заберу, команда не нужна:\n  - Instagram: reels, фото, карусели целиком\n  - TikTok: видео без водяного знака и фото-слайдшоу\n  - Twitter/X: видео и фото, а для текстового поста — аккуратная карточка\n  - Pinterest: пин в полном размере\n  - Reddit: медиа, если это медиа-пост, или карточка, если это текст\n\nКоманды:\n/caption on|off - включить/выключить подпись "via @{username}" на загрузках\n/lossless on|off - получать загрузки несжатыми файлами\n/donate - помочь с расходами на хостинг (совершенно необязательно)\n/cancel - остановить то, чего я от вас жду (спрошу, что именно)\n/en, /uz, /rus - сменить язык (или /language — он спрашивает)\n\n⚠️ ВНИМАНИЕ: платежи окончательные — Stars, оплаченные через /donate, НЕ возвращаются, а добавленный ими ⚡ кредит НЕЛЬЗЯ вывести.\n\n',
+        "help_text": 'Просто пришли ссылку в любое время — я её заберу, команда не нужна:\n  - Instagram: reels, фото, карусели целиком\n  - TikTok: видео без водяного знака и фото-слайдшоу\n  - Twitter/X: видео и фото, а для текстового поста — аккуратная карточка\n  - Pinterest: пин в полном размере\n  - Reddit: медиа, если это медиа-пост, или карточка, если это текст\n\nКоманды:\n/settings - подпись и качество файлов, всё на одном экране\n/caption on|off - подпись "via @{username}" на загрузках, отдельно\n/lossless on|off - получать загрузки несжатыми файлами\n/donate - помочь с расходами на хостинг (совершенно необязательно)\n/cancel - остановить то, чего я от вас жду (спрошу, что именно)\n/en, /uz, /rus - сменить язык (или /language — он спрашивает)\n\n⚠️ ВНИМАНИЕ: платежи окончательные — Stars, оплаченные через /donate, НЕ возвращаются, а добавленный ими ⚡ кредит НЕЛЬЗЯ вывести.\n\n',
         "caption_state_on": "ВКЛ",
         "caption_state_off": "ВЫКЛ",
+        "settings_heading": "⚙️ Ваши настройки. Нажмите, чтобы изменить.",
         "caption_status": "Подпись сейчас {state}.",
         "caption_turned": "Подпись к загрузкам теперь {state}.",
         "caption_toggle_answer": "Подпись теперь {state}.",
@@ -628,29 +655,27 @@ async def get_lang(user_id: int, context) -> str:
 
 COMMAND_MENU = {
     "uz": {
-        "start": "Boshlash / ko'rsatmalarni ko'rish",
-        "help": "Bot qanday ishlaydi",
-        "caption": "Yuklamalardagi manba izohini yoqish/o'chirish",
-        "lossless": "Yuklamalarni siqilmagan fayl sifatida yuborish",
-        "cancel": "Kutilayotgan amalni bekor qilish",
-        "balance": "⚡ kredit balansingiz",
+        "start": "Bu bot nima qiladi va qanday boshlash kerak",
+        "settings": "Izoh va fayl sifati sozlamalari",
+        "cancel": "Kutayotgan amalimni to'xtatish",
+        "help": "Nimalar qila olaman",
+        "balance": "⚡ kreditingiz",
         "donate": "Server xarajatlariga hissa qo'shish",
-        "paysupport": "To'lov bo'yicha yordam",
-        "privacy": "Bot siz haqingizda nima saqlaydi",
-        "terms": "Botdan nima uchun foydalanish mumkin",
-        "deletemydata": "Bot saqlagan ma'lumotlaringizni o'chirish",
+        "paysupport": "To'lov bilan muammo",
+        "privacy": "Siz haqingizda nimalarni saqlayman",
+        "terms": "Botdan foydalanish shartlari",
+        "deletemydata": "Siz haqingizdagi hamma narsani o'chirish",
     },
     "ru": {
-        "start": "Начать / посмотреть инструкцию",
-        "help": "Как работает этот бот",
-        "caption": "Включить или убрать подпись с источником",
-        "lossless": "Присылать загрузки несжатыми файлами",
-        "cancel": "Отменить то, чего я жду",
-        "balance": "Ваш баланс — кредиты",
-        "donate": "Поддержать — расходы на хостинг",
-        "paysupport": "Помощь с платежом",
-        "privacy": "Что бот хранит о вас",
-        "terms": "Для чего можно использовать бота",
-        "deletemydata": "Удалить всё, что бот о вас хранит",
+        "start": "Что этот бот делает и с чего начать",
+        "settings": "Подпись и качество файлов",
+        "cancel": "Остановить то, чего я жду",
+        "help": "Что я умею",
+        "balance": "Ваш ⚡ кредит",
+        "donate": "Помочь с расходами на хостинг",
+        "paysupport": "Проблема с оплатой",
+        "privacy": "Что я о вас храню",
+        "terms": "Для чего можно пользоваться ботом",
+        "deletemydata": "Удалить всё, что я о вас храню",
     },
 }

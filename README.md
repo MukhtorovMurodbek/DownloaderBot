@@ -189,3 +189,13 @@ Python 3.11 or newer, Postgres 16 or newer, and `ffmpeg`.
 This bot downloads publicly accessible posts on behalf of the person asking
 for them. It is not a way around a private account, and it does not attempt
 to be. Whoever runs it is responsible for how it is used where they run it.
+
+## Licence
+
+AGPL-3.0-or-later — see [LICENSE](LICENSE).
+
+This is the licence the AGPL'd PyMuPDF asks for, and §13 of it is the reason:
+anybody who interacts with this software over a network must be offered its
+source. A Telegram bot is exactly that case, since nobody using it ever holds
+a copy. The source is here, which satisfies §13 for this deployment; anybody
+running a modified version as a service has to publish their changes too.

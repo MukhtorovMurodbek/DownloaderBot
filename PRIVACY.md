@@ -31,10 +31,30 @@ _Last reviewed: 10 September 2026._
 - **Bonus credit, and when it expires** — for each payment that earned a
   bonus: how much, how much of it is left, and the date it runs out. Bonus
   that runs out unused is taken off the balance, and the ledger says so.
-- **Problem reports you choose to send** — when you tap "Report the issue"
-  under an error and confirm: the error code, an incident number, when it
-  happened and the bot's version. Nothing in a report identifies you, and the
-  bot shows exactly what it sends before you send it.
+- **Problems, whenever one is shown to anybody** — the error code, an
+  incident number, when it happened and the bot's version. This is written
+  down automatically, because a fault nobody reports is still a fault, and
+  nothing in it is about you: not your ID, not your name, not what you sent.
+  The message that carries the code says so, above the button.
+- **Your own details, only if you add them** — tapping "Add my details" under
+  an error offers to attach four things to that incident: your Telegram user
+  ID, your @username if you have one, the language you picked, and whether the
+  chat is private or a group. All four are named on screen before anything is
+  sent, and nothing is sent unless you tap Send. Not what you wrote and not
+  the file you sent, ever.
+
+  Those four are **cleared after 30 days**, automatically, whether or not you
+  ask. The record of the error itself stays — it still happened, and a count
+  of it is not about anybody — but after a month it no longer says who hit it.
+  `/deletemydata` clears them straight away instead of waiting.
+
+  The error records themselves are kept for **180 days** and then deleted.
+
+  One more thing worth saying plainly: the operator is messaged the moment a
+  serious error happens — a crash, or a message this bot accepted and failed
+  to deliver — so those are seen the same day rather than in a list. That
+  message says which error and when. It does not say who, even when somebody
+  has attached their details; the operator has to look those up deliberately.
 - **Work in progress** — a download waiting on a choice, so it survives a
   restart.
 

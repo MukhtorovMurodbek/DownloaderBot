@@ -1409,6 +1409,8 @@ def privacy_text(lang: str) -> str:
         heading(i18n.t(lang, "privacy_heading")),
         heading(i18n.t(lang, "privacy_kept_heading")) + "\n"
         + collapsed(i18n.t(lang, "privacy_stored")),
+        heading(i18n.t(lang, "privacy_problems_heading")) + "\n"
+        + collapsed(i18n.t(lang, "privacy_problems")),
         heading(i18n.t(lang, "privacy_seen_by_heading")) + "\n"
         + body(i18n.t(lang, "privacy_seen_by")) + "\n"
         + body(i18n.t(lang, "privacy_others")),
@@ -1540,6 +1542,17 @@ async def delete_my_data_chosen(update, context):
     except Exception:
         logging.getLogger(__name__).exception(
             "Cleared %s's data but could not clear their saved state", user_id
+        )
+    # The family table, which is not this bot's own and so is not in
+    # db.erase_user. Only the part that is about them: a problem they reported
+    # still counts as a problem afterwards, it just no longer says who hit it.
+    # Reported on separately for the same reason as the line above -- failing
+    # it does not make "your data is gone" untrue of the tables that did.
+    try:
+        rows += await asyncio.to_thread(family_link.forget_problem_reporter, user_id)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Cleared %s's data but could not take them off their problem reports", user_id
         )
 
     # Rendered before the cache is dropped, because the chosen language is
@@ -2038,13 +2051,178 @@ def error_summary() -> str:
 # automatically with time and id, but this one is simple." Which problems are
 # simple is problems.SIMPLE.
 #
-# A report sends nothing personal, and the disclaimer before it says exactly
-# what it does send. It is stored in the shared database and messaged to the
-# owner's account; if the owner has never started this bot, it is raised as a
-# warning event instead, which ManagerBot forwards.
+# **The problem is written down whether or not anybody taps anything.** The
+# owner, in 1.7.0: "It should include the error without user pressing the
+# report button, but should only store generic technical data with no user
+# specific info, and that this issue is logged with no user data." So every
+# coded message any bot sends puts a row in family.problem_reports holding the
+# bot, the code, the incident, the time and the version -- and says so, on the
+# message, above the button.
+#
+# That changes what the button is for. It used to be the only way a problem
+# reached the owner at all, which made "Report the issue" a chore somebody did
+# on the bot's behalf. Now the problem is already there, and tapping adds the
+# one thing it cannot have without asking: who it happened to. The owner:
+# "If the user wants to help, they can press the report button to include user
+# specific data - type of data should be mentioned before actually sending the
+# user details." The disclaimer names each field before anything is sent, and
+# nothing is sent until Send is tapped.
+#
+# What goes to the owner's Telegram is still only that a report arrived, with
+# the code and the incident. Who sent it is read with ManagerBot's /report
+# <incident>, deliberately, rather than pushed at them unasked.
 
 REPORTS_TO = int(os.environ.get("FAMILY_REPORTS_TO") or 8796896653)
 REPORT_BUTTONS = (os.environ.get("FAMILY_REPORT_BUTTONS") or "on").strip().lower() not in ("0", "off", "no", "false")
+
+# Recording every problem could not go on the sending path. A coded message is
+# sent from inside a failure, often several at once -- FM-FLOOD is by
+# definition many people at the same moment -- and a Postgres round trip there
+# would add the database to the list of things that can go wrong while the bot
+# is already going wrong, and add it to the *user's* wait.
+#
+# So occurrences collect here and go out as one pass on a timer, the same
+# shape as the activity buffer further down for the same reason. A hard kill
+# loses at most one window of them, and they are in this bot's own problems.log
+# either way.
+PROBLEM_FLUSH_SECONDS = int(os.environ.get("PROBLEM_FLUSH_SECONDS", "20"))
+MAX_BUFFERED_PROBLEMS = 500
+
+# ---------------------------------------------------------------------------
+# Which problems interrupt the owner, and how often
+# ---------------------------------------------------------------------------
+# problems.level() says what a code is worth (1 urgent / 2 fault / 3 refused).
+# Two rules turn that into messages:
+#
+#   An urgent problem is sent the moment it happens -- but at most once per
+#   code per ALERT_COOLDOWN_SECONDS. A crash loop is one fault, not four
+#   hundred, and four hundred messages is the fastest way to make somebody
+#   stop reading the one that mattered. What the cooldown suppresses is
+#   counted and carried into the next alert for that code.
+#
+#   A *fault* escalates to an urgent alert when the same code happens
+#   BURST_COUNT times inside BURST_WINDOW_SECONDS. Fifty "all download routes
+#   failed" in an hour is not fifty people having bad luck, it is a route that
+#   has gone down -- which is a level-1 fact assembled out of level-2 parts,
+#   and the only way to notice it on the day rather than in the nightly
+#   report.
+ALERT_COOLDOWN_SECONDS = int(os.environ.get("PROBLEM_ALERT_COOLDOWN_SECONDS", "900"))
+BURST_COUNT = int(os.environ.get("PROBLEM_BURST_COUNT", "15"))
+BURST_WINDOW_SECONDS = int(os.environ.get("PROBLEM_BURST_WINDOW_SECONDS", "3600"))
+
+_problem_buffer: "OrderedDict[tuple, object]" = OrderedDict()
+# code -> (monotonic time of the last alert, how many were suppressed since)
+_alerted: "dict[str, list]" = {}
+# code -> deque of monotonic times, for the burst rule
+_recent_faults: "dict[str, deque]" = {}
+
+
+def _should_alert(code: str, now: float) -> "tuple[bool, int]":
+    """(send one now?, how many went unreported since the last one).
+
+    The whole cooldown lives here rather than in the caller, so the counting
+    and the decision cannot drift apart."""
+    last, suppressed = _alerted.get(code, (None, 0))
+    if last is not None and now - last < ALERT_COOLDOWN_SECONDS:
+        _alerted[code] = [last, suppressed + 1]
+        return False, 0
+    _alerted[code] = [now, 0]
+    return True, suppressed
+
+
+def _is_burst(code: str, now: float) -> bool:
+    """Whether this code has just crossed the burst threshold."""
+    seen = _recent_faults.setdefault(code, deque())
+    seen.append(now)
+    while seen and now - seen[0] > BURST_WINDOW_SECONDS:
+        seen.popleft()
+    return len(seen) >= BURST_COUNT
+
+
+def _alert_owner(code: str, incident: str, level: int, now: float) -> None:
+    """Put an urgent problem on the family event bus, which is what ManagerBot
+    forwards to the owner. Nothing here identifies anybody: the code, the
+    incident and how many there were.
+
+    An event, not a direct message: the bots do not hold the owner's chat and
+    should not learn to. ManagerBot already decides what is worth a message
+    (its ALERT_LEVELS) and already handles the owner never having started a
+    bot, so this rides the rail that exists."""
+    send, suppressed = _should_alert(code, now)
+    if not send:
+        return
+    problem = problems.PROBLEMS.get(code)
+    title = problem.title if problem else code
+    burst = level != problems.level(code)
+    message = f"{code} — {title}"
+    if burst:
+        message += (f" — {BURST_COUNT}+ of these in the last "
+                    f"{BURST_WINDOW_SECONDS // 60} minutes, so this looks like it is down "
+                    f"rather than unlucky")
+    if suppressed:
+        message += f" (+{suppressed} more since the last alert)"
+    emit_event("critical" if not burst else "error", "problem",
+               message, f"Incident {incident} · /report {incident} for anything a user added")
+
+
+def note_occurrence(code: str, incident: str, occurred_at) -> None:
+    """Remember that this problem was shown, to be written out on the next
+    pass -- and interrupt the owner if it is the kind that cannot wait.
+
+    Keyed by incident, so a message redrawn with the same problem still on it
+    is one occurrence here as well as one line in the log."""
+    key = (code, incident)
+    if key in _problem_buffer:
+        return
+    _problem_buffer[key] = occurred_at
+    level = problems.level(code)
+    try:
+        now = time.monotonic()
+        if level == problems.URGENT:
+            _alert_owner(code, incident, problems.URGENT, now)
+        elif level == problems.FAULT and _is_burst(code, now):
+            _alert_owner(code, incident, problems.URGENT, now)
+    except Exception:
+        # An alert that fails must never cost the record it was alerting
+        # about -- the row below is the thing that has to survive.
+        logging.getLogger(__name__).debug("Could not alert on %s", code, exc_info=True)
+    # A ceiling rather than unbounded growth: if the database is unreachable
+    # for an hour the buffer must not become the reason the container dies.
+    # The oldest go, because the newest are the ones somebody might still be
+    # looking at a Report button for.
+    while len(_problem_buffer) > MAX_BUFFERED_PROBLEMS:
+        _problem_buffer.popitem(last=False)
+
+
+def _flush_problems_now() -> int:
+    """Blocking; call through asyncio.to_thread. Takes the whole buffer in one
+    swap so a problem arriving mid-flush lands in the next window rather than
+    being lost."""
+    global _problem_buffer
+    if not _problem_buffer:
+        return 0
+    batch, _problem_buffer = _problem_buffer, OrderedDict()
+    written = 0
+    for (code, incident), occurred_at in batch.items():
+        try:
+            family_link.record_problem_occurrence(code, incident, occurred_at,
+                                                  problems.level(code))
+            written += 1
+        except Exception:
+            # Put back what is left, including this one, and stop: a database
+            # that refused one row will refuse the next forty too.
+            leftover = OrderedDict(list(batch.items())[written:])
+            leftover.update(_problem_buffer)
+            _problem_buffer = leftover
+            raise
+    return written
+
+
+async def _flush_problems_job(context) -> None:
+    try:
+        await asyncio.to_thread(_flush_problems_now)
+    except Exception:
+        logging.getLogger(__name__).debug("Problem flush failed; will retry", exc_info=True)
 
 _chat_langs: "OrderedDict[int, str]" = OrderedDict()
 
@@ -2072,6 +2250,26 @@ def report_markup(lang: str, code: str, incident: str, markup=None):
     rows.append([InlineKeyboardButton(i18n.t(lang, "report_button"),
                                       callback_data=f"rpt:{code}:{incident}")])
     return InlineKeyboardMarkup(rows)
+
+
+def _with_logged_note(text: str, code: str, lang: str) -> str:
+    """The same message, with one line saying it has already been written down
+    and that nothing in what was written is about them.
+
+    Above the code line, never below it: problems.find_code only recognises a
+    code at the very end, and a note underneath it would make every one of
+    these messages uncoded to everything that reads them afterwards -- the
+    Report button included.
+
+    Only on problems that offer a button, which is where somebody is being
+    asked to decide something. "I don't recognize that command" explains
+    itself and does not need a paragraph about logging under it.
+    """
+    note = i18n.t(lang, "problem_logged_note")
+    body = problems.strip_code(text)
+    if note in body:
+        return text
+    return f"{body}\n\n{note}{problems.code_line(code)}"
 
 
 def _has_report(markup) -> bool:
@@ -2116,19 +2314,21 @@ def _remember_incident(chat_id, message_id, code: str, incident: str) -> None:
 
 
 async def note_problem(chat_id, message_id, text, kwargs: dict):
-    """A message on its way out. If it ends in a problem code: log it, with a
-    new incident or the one this message already had, and give it a Report
-    button if the problem deserves one. Returns (code, incident), or
-    (None, None) for a message with no code."""
+    """A message on its way out. If it ends in a problem code: log it, write it
+    down for the owner, and give it a Report button if the problem deserves
+    one. Returns (code, incident, text) -- the text possibly grown by a line
+    saying the problem is already recorded -- or (None, None, text) for a
+    message with no code."""
     code = problems.find_code(text) if isinstance(text, str) else None
     if not code:
-        return None, None
+        return None, None, text
     markup = kwargs.get("reply_markup")
     made = _button_incident(markup)
     known = _incidents.get((chat_id, message_id, code)) if message_id is not None else None
     incident = made or known or problems.new_incident()
-    if (made is None and REPORT_BUTTONS and problems.reportable(code)
-            and (markup is None or isinstance(markup, InlineKeyboardMarkup))):
+    wants_button = (made is None and REPORT_BUTTONS and problems.reportable(code)
+                    and (markup is None or isinstance(markup, InlineKeyboardMarkup)))
+    if wants_button or problems.reportable(code):
         lang = _chat_langs.get(chat_id)
         if lang is None and isinstance(chat_id, int):
             try:
@@ -2136,16 +2336,25 @@ async def note_problem(chat_id, message_id, text, kwargs: dict):
             except Exception:
                 lang = None
             remember_chat_lang(chat_id, lang)
+        lang = lang or "en"
+        if wants_button:
+            try:
+                kwargs["reply_markup"] = report_markup(lang, code, incident, markup)
+            except Exception:
+                logging.getLogger(__name__).debug("Could not add a report button", exc_info=True)
         try:
-            kwargs["reply_markup"] = report_markup(lang or "en", code, incident, markup)
+            text = _with_logged_note(text, code, lang)
         except Exception:
-            logging.getLogger(__name__).debug("Could not add a report button", exc_info=True)
+            logging.getLogger(__name__).debug("Could not add the logged note", exc_info=True)
     if incident != known:
         problem_log.info("%s incident %s, %s", code, incident,
                          "with a Report button" if _has_report(kwargs.get("reply_markup"))
                          else "no Report button")
+        # Every problem, not only the ones somebody chooses to report, and not
+        # only the ones that offer a button. Buffered -- see note_occurrence.
+        note_occurrence(code, incident, datetime.now(timezone.utc))
     _remember_incident(chat_id, message_id, code, incident)
-    return code, incident
+    return code, incident, text
 
 
 def _log_problems_to_file() -> None:
@@ -2178,7 +2387,7 @@ def attach_problem_reports(application) -> None:
         return
 
     async def send_message(self, chat_id, text, *args, **kwargs):
-        code, incident = await note_problem(chat_id, None, text, kwargs)
+        code, incident, text = await note_problem(chat_id, None, text, kwargs)
         sent = await base.send_message(self, chat_id, text, *args, **kwargs)
         if code:
             _remember_incident(chat_id, getattr(sent, "message_id", None), code, incident)
@@ -2187,15 +2396,19 @@ def attach_problem_reports(application) -> None:
     async def edit_message_text(self, text, *args, **kwargs):
         chat_id = kwargs.get("chat_id", args[0] if args else None)
         message_id = kwargs.get("message_id", args[1] if len(args) > 1 else None)
-        await note_problem(chat_id, message_id, text, kwargs)
+        _, _, text = await note_problem(chat_id, message_id, text, kwargs)
         return await base.edit_message_text(self, text, *args, **kwargs)
 
     async def answer_callback_query(self, callback_query_id, *args, **kwargs):
-        # A pop-up cannot hold a button, but it is a problem shown all the same.
+        # A pop-up cannot hold a button, but it is a problem shown all the
+        # same -- so it is logged and recorded like any other, and only the
+        # button is missing.
         text = kwargs.get("text", args[0] if args else None)
         code = problems.find_code(text) if isinstance(text, str) else None
         if code:
-            problem_log.info("%s incident %s, a pop-up", code, problems.new_incident())
+            incident = problems.new_incident()
+            problem_log.info("%s incident %s, a pop-up", code, incident)
+            note_occurrence(code, incident, datetime.now(timezone.utc))
         return await base.answer_callback_query(self, callback_query_id, *args, **kwargs)
 
     reporting = type(base.__name__, (base,), {
@@ -2212,17 +2425,60 @@ def attach_problem_reports(application) -> None:
 
 
 async def _send_report_to_owner(bot, code: str, incident: str, occurred_at) -> None:
+    """Somebody attached their own details to a problem.
+
+    **Urgent problems only.** The owner, in 1.7.0: "If user decides to report
+    with additional details, highest level errors should get a new message,
+    something like details provided for.., and for others it should be sent
+    along with the daily report." A fault somebody bothered to sign is worth
+    reading; it is not worth a notification at four in the morning, and the
+    nightly report already lists it with a 🙋 beside it.
+
+    It says that details were attached; it does not say what they are. The
+    owner's standing rule is that nothing a bot pushes at them identifies a
+    user, and somebody consenting to be identified does not repeal it -- what
+    the consent bought is the owner being *able* to look. /report <incident>
+    in ManagerBot is the looking.
+    """
+    if not problems.urgent(code):
+        return
     label = os.environ.get("FAMILY_LABEL") or getattr(family_link, "_display_name", None) \
         or family_link._bot_id or "a bot"
-    text = (f"🐞 Problem report from {label}\n"
-            f"Incident {incident} · happened {occurred_at:%Y-%m-%d %H:%M} UTC · version {family_link.VERSION}\n\n"
-            + problems.decode(code))
+    text = (f"🙋 Details provided for {incident} — {label}\n"
+            f"Happened {occurred_at:%Y-%m-%d %H:%M} UTC · version {family_link.VERSION}\n\n"
+            + problems.decode(code)
+            + f"\n\nSomebody attached their own details to this one. "
+              f"/report {incident} in ManagerBot to see them.")
     try:
         await bot.send_message(chat_id=REPORTS_TO, text=text)
         return
     except Exception:
         logging.getLogger(__name__).info("Could not message problem report %s directly", incident, exc_info=True)
     emit_event("warning", "report", text)
+
+
+# One open "shall I send your details?" question per problem per chat. Two taps
+# on the same Report button used to put two of them in the chat, and answering
+# one left the other sitting there still offering to send -- which reads, a
+# minute later, as the bot having sent the report on its own.
+_open_dialogs: "OrderedDict[tuple, int]" = OrderedDict()
+
+
+def _remember_dialog(chat_id, incident: str, message_id: int) -> None:
+    _open_dialogs[(chat_id, incident)] = message_id
+    _open_dialogs.move_to_end((chat_id, incident))
+    while len(_open_dialogs) > 512:
+        _open_dialogs.popitem(last=False)
+
+
+async def _close_open_dialog(bot, chat_id, incident: str) -> None:
+    message_id = _open_dialogs.pop((chat_id, incident), None)
+    if message_id is None:
+        return
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not take down an old report question", exc_info=True)
 
 
 async def problem_report_callback(update, context) -> None:
@@ -2234,6 +2490,11 @@ async def problem_report_callback(update, context) -> None:
     action = parts[0]
     if action == "rptc":
         await query.answer()
+        chat = getattr(query.message, "chat", None)
+        for key, message_id in list(_open_dialogs.items()):
+            if key[0] == (getattr(chat, "id", None) or user.id) \
+                    and message_id == getattr(query.message, "message_id", None):
+                _open_dialogs.pop(key, None)
         await live_message.edit_in_place(query.message, context.bot, i18n.t(lang, "report_cancelled"))
         return
     code = parts[1] if len(parts) > 1 else ""
@@ -2242,6 +2503,8 @@ async def problem_report_callback(update, context) -> None:
         await query.answer(i18n.t(lang, "report_invalid"), show_alert=True)
         return
     await query.answer()
+    chat = getattr(query.message, "chat", None)
+    chat_id = getattr(chat, "id", None) or user.id
     if action == "rpt":
         # When the message with the problem was sent. A message too old for
         # Telegram to hand back has a date of 1970, which is no use to anyone.
@@ -2253,26 +2516,33 @@ async def problem_report_callback(update, context) -> None:
                                  callback_data=f"rpts:{code}:{incident}:{int(when.timestamp())}"),
             InlineKeyboardButton(i18n.t(lang, "report_cancel"), callback_data="rptc"),
         ]])
-        # Into the chat the button was in, so it works in a group as well as
-        # in private; nothing in it is personal.
-        chat = getattr(query.message, "chat", None)
-        await context.bot.send_message(
-            chat_id=getattr(chat, "id", None) or user.id, reply_markup=keyboard,
+        # A second tap replaces the first question rather than adding one --
+        # see _open_dialogs. Into the chat the button was in, so it works in a
+        # group as well as in private.
+        await _close_open_dialog(context.bot, chat_id, incident)
+        sent = await context.bot.send_message(
+            chat_id=chat_id, reply_markup=keyboard,
             text=i18n.t(lang, "report_disclaimer", code=code, incident=incident))
+        _remember_dialog(chat_id, incident, getattr(sent, "message_id", None))
         return
     stamp = parts[3] if len(parts) > 3 else ""
     occurred_at = (datetime.fromtimestamp(int(stamp), tz=timezone.utc) if stamp.isdigit()
                    else datetime.now(timezone.utc))
+    _open_dialogs.pop((chat_id, incident), None)
     try:
-        new = await asyncio.to_thread(family_link.record_problem_report, code, incident, occurred_at)
+        new = await asyncio.to_thread(
+            family_link.attach_problem_reporter, code, incident, occurred_at,
+            user.id, getattr(user, "username", None), lang,
+            getattr(chat, "type", None), problems.level(code))
     except Exception:
         logging.getLogger(__name__).exception("Could not store problem report %s (%s)", incident, code)
         await live_message.edit_in_place(query.message, context.bot, i18n.t(lang, "report_failed"))
         return
     if new:
         await _send_report_to_owner(context.bot, code, incident, occurred_at)
-    await live_message.edit_in_place(query.message, context.bot,
-                                     i18n.t(lang, "report_sent" if new else "report_already"))
+    await live_message.edit_in_place(
+        query.message, context.bot,
+        i18n.t(lang, "report_sent" if new else "report_already", incident=incident))
 
 
 async def _tell_about_crash(update, context, incident: str) -> None:
@@ -2492,6 +2762,9 @@ def attach_maintenance(app) -> None:
     app.job_queue.run_repeating(
         _flush_activity_job, interval=ACTIVITY_FLUSH_SECONDS, first=ACTIVITY_FLUSH_SECONDS
     )
+    app.job_queue.run_repeating(
+        _flush_problems_job, interval=PROBLEM_FLUSH_SECONDS, first=PROBLEM_FLUSH_SECONDS
+    )
     app.job_queue.run_repeating(_maintenance_job, interval=3600, first=3600)
     # Offset by a minute so a redeploy does not have all five bots writing a
     # usage row into one second, and so the first window is a real window
@@ -2510,6 +2783,10 @@ async def flush_on_shutdown(application) -> None:
         await asyncio.to_thread(_flush_activity_now)
     except Exception:
         logging.getLogger(__name__).debug("Final activity flush failed", exc_info=True)
+    try:
+        await asyncio.to_thread(_flush_problems_now)
+    except Exception:
+        logging.getLogger(__name__).debug("Final problem flush failed", exc_info=True)
     close = getattr(db, "close_pool", None)
     if close is not None:
         try:

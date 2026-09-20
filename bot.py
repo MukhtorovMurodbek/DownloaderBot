@@ -301,21 +301,31 @@ def build_help_text(lang: str) -> str:
 # commands are described in the language they switch to (self-explanatory
 # by script/language, since Telegram's command menu itself isn't per-user).
 BOT_COMMANDS = [
-    BotCommand("start", "Start here / see the instructions"),
-    BotCommand("help", "How this bot works"),
-    BotCommand("caption", "Toggle the credit caption on downloads"),
-    BotCommand("lossless", "Send downloads as uncompressed files"),
-    BotCommand("cancel", "Stop whatever I'm waiting for"),
-    BotCommand("balance", "Your credit balance"),
-    BotCommand("donate", "Contribute to hosting costs"),
-    BotCommand("paysupport", "Help with a payment"),
+    # Order is deliberate: what this is, how to change language, what the bot
+    # does, how to stop it, help, money, then the policies. /language sits
+    # second on the owner's instruction -- somebody reading a menu in the
+    # wrong language needs the way out before anything else.
+    #
+    # /en, /uz and /rus are NOT here and still work. They are the way back for
+    # somebody who cannot read the menu at all, so they must never stop
+    # working -- but three lines for what /language already does is three
+    # lines of noise for everybody who can read it.
+    #
+    # /caption and /lossless are gone from here and still work. Both are one
+    # switch each, and "lossless" is a word for people who already know what
+    # it means; /settings says what it is in a word everybody knows and shows
+    # both switches with their current state on them.
+    BotCommand("start", "What I do, and how to start"),
     BotCommand("language", "Choose your language / Tilni tanlash / Выбрать язык"),
-    BotCommand("en", "Switch to English"),
-    BotCommand("uz", "O'zbekchaga o'tish"),
-    BotCommand("rus", "Переключиться на русский"),
-    BotCommand("privacy", "What this bot keeps about you"),
-    BotCommand("terms", "What this bot may be used for"),
-    BotCommand("deletemydata", "Erase what this bot holds on you"),
+    BotCommand("settings", "Captions and file quality"),
+    BotCommand("cancel", "Stop whatever I am waiting for"),
+    BotCommand("help", "Everything I can do"),
+    BotCommand("balance", "Your ⚡ credit"),
+    BotCommand("donate", "Chip in for hosting costs"),
+    BotCommand("paysupport", "Trouble with a payment"),
+    BotCommand("privacy", "What I keep about you"),
+    BotCommand("terms", "What I may be used for"),
+    BotCommand("deletemydata", "Delete everything I hold on you"),
 ]
 
 # The same menu, in the owner's own chat, with the commands only they can
@@ -582,6 +592,31 @@ async def lossless_toggle_callback(update: Update, context: ContextTypes.DEFAULT
         i18n.t(lang, "lossless_status", state=state),
         reply_markup=_lossless_keyboard(lang, enabled),
     )
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Both switches this bot has, on one screen, with their state on them.
+
+    /caption and /lossless still work and still do exactly this one at a
+    time. What they were not was findable: a menu entry saying "lossless" is
+    a word for somebody who already knows what it means, and the two of them
+    were 2 of the 15 lines in a menu whose other 13 are about the bot or the
+    law. One entry called settings is what a person looks for when they want
+    to change something.
+    """
+    lang = await i18n.get_lang(update.effective_user.id, context)
+    caption_on = await asyncio.to_thread(get_caption_enabled, update.effective_user.id)
+    lossless_on = await asyncio.to_thread(get_lossless_enabled, update.effective_user.id)
+    caption_state = i18n.t(lang, "caption_state_on" if caption_on else "caption_state_off")
+    lossless_state = i18n.t(lang, "lossless_state_on" if lossless_on else "lossless_state_off")
+    text = (i18n.t(lang, "settings_heading") + "\n\n"
+            + i18n.t(lang, "caption_status", state=caption_state) + "\n\n"
+            + i18n.t(lang, "lossless_status", state=lossless_state))
+    keyboard = InlineKeyboardMarkup(
+        _caption_keyboard(lang, caption_on).inline_keyboard
+        + _lossless_keyboard(lang, lossless_on).inline_keyboard
+    )
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def dbdump_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1346,6 +1381,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("caption", caption_toggle))
     app.add_handler(CommandHandler("lossless", lossless_toggle))
     app.add_handler(CommandHandler("dbdump", dbdump_command))  # owner-only
